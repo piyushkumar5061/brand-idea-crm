@@ -1,6 +1,6 @@
 # Brand Idea CRM
 
-Internal sales CRM for **brandideaonline.com** — React + Vite + TypeScript + Tailwind + shadcn/ui, backed by Supabase (Postgres + Auth + RLS).
+Internal sales CRM for **crm.brandideaonline.com** — React + Vite + TypeScript + Tailwind + shadcn/ui, backed by Supabase (Postgres + Auth + RLS).
 
 ## Stack
 - React 18 + Vite 5 + TypeScript
