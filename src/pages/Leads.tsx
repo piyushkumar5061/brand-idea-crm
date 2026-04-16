@@ -19,9 +19,12 @@ import { Calendar } from '@/components/ui/calendar';
 import { toast } from 'sonner';
 import { format as formatDate } from 'date-fns';
 import DispositionModal from '@/components/DispositionModal';
+import { cn } from '@/lib/utils';
 import {
   Phone, Search, Filter, X, Trash2, ChevronLeft, ChevronRight,
   MessageCircle, Users, SlidersHorizontal, CalendarIcon, AlertTriangle,
+  LayoutList, KanbanSquare, Filter as FunnelIcon, Trophy, Flame,
+  CircleDot,
 } from 'lucide-react';
 
 interface Lead {
@@ -79,10 +82,38 @@ const OPERATORS = [
   { value: 'lt', label: 'Less Than' },
 ];
 
+// ---------------------------------------------------------------------------
+// CRM chrome configuration — additive overlay on top of school-sales-buddy core
+// ---------------------------------------------------------------------------
+type ViewMode = 'list' | 'kanban' | 'funnel';
+type Priority = 'all' | 'P1' | 'P2' | 'P3' | 'P4';
+
+const PRIORITIES: { value: Priority; label: string }[] = [
+  { value: 'all', label: 'All' },
+  { value: 'P1',  label: 'P1' },
+  { value: 'P2',  label: 'P2' },
+  { value: 'P3',  label: 'P3' },
+  { value: 'P4',  label: 'P4' },
+];
+
+/** Buckets used to split the board into columns (Kanban) or stages (Funnel). */
+const PIPELINE_STAGES: { key: string; label: string; match: (l: Lead) => boolean }[] = [
+  { key: 'new',         label: 'New',         match: l => !l.current_status || l.current_status === 'new' },
+  { key: 'contacted',   label: 'Contacted',   match: l => l.category === 'contacted' && l.current_status !== 'Deal closed' && l.current_status !== 'Ready to pay' },
+  { key: 'qualified',   label: 'Qualified',   match: l => l.current_status === 'Call back' || l.current_status === 'Ready to join session' },
+  { key: 'hot',         label: 'Hot',         match: l => l.current_status === 'Ready to pay' },
+  { key: 'won',         label: 'Won',         match: l => l.current_status === 'Deal closed' },
+  { key: 'lost',        label: 'Lost',        match: l => !!l.current_status && (l.current_status.includes('Not interested') || l.current_status === 'After session joined not interested') },
+];
+
 export default function Leads() {
   const { user, isAdminOrAbove } = useAuth();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+
+  // ── NEW CRM chrome state (additive — does not replace anything) ───────────
+  const [view, setView] = useState<ViewMode>('list');
+  const [priority, setPriority] = useState<Priority>('all');
 
   // Search + filters
   const [search, setSearch] = useState('');
@@ -106,7 +137,7 @@ export default function Leads() {
   const [deleting, setDeleting] = useState(false);
 
   // Pagination
-  const [pageSize, setPageSize] = useState<string>('50'); // '10'|'50'|'100'|'500'|'all'
+  const [pageSize, setPageSize] = useState<string>('50');
   const [page, setPage] = useState(0);
 
   // ---------- Queries ----------
@@ -114,7 +145,7 @@ export default function Leads() {
     'leads',
     { search, filterSource, filterStatus, filterDisposition, filterOwner,
       filterFollowUpDate: filterFollowUpDate ? formatDate(filterFollowUpDate, 'yyyy-MM-dd') : null,
-      filterOverdue, advApplied, pageSize, page,
+      filterOverdue, advApplied, pageSize, page, priority,
       role: isAdminOrAbove ? 'admin' : 'employee', userId: user?.id ?? null },
   ];
 
@@ -133,13 +164,17 @@ export default function Leads() {
       if (!isAdminOrAbove && user) query = query.eq('assigned_to', user.id);
 
       if (search) {
-        // OR search on name / phone / email
         query = query.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`);
       }
       if (filterSource) query = query.eq('source', filterSource);
       if (filterStatus) query = query.eq('current_status', filterStatus);
       if (filterDisposition) query = query.eq('disposition', filterDisposition);
       if (filterOwner) query = query.eq('assigned_to', filterOwner);
+
+      // Priority tab (stored in custom_fields.priority as "P1"/"P2"/"P3"/"P4")
+      if (priority !== 'all') {
+        query = query.eq('custom_fields->>priority', priority);
+      }
 
       if (filterFollowUpDate) {
         query = query.eq('follow_up_date', formatDate(filterFollowUpDate, 'yyyy-MM-dd'));
@@ -178,6 +213,39 @@ export default function Leads() {
   const leads = leadsData?.rows ?? [];
   const totalCount = leadsData?.total ?? 0;
 
+  // ── KPI query: runs four parallel counts, role-scoped, resilient on failure.
+  const { data: kpis } = useQuery({
+    queryKey: ['lead-kpis', { role: isAdminOrAbove ? 'admin' : 'employee', userId: user?.id ?? null }],
+    enabled: !!user,
+    queryFn: async () => {
+      const base = () => {
+        let q = supabase.from('leads').select('id', { count: 'exact', head: true });
+        if (!isAdminOrAbove && user) q = q.eq('assigned_to', user.id);
+        return q;
+      };
+      const today = formatDate(new Date(), 'yyyy-MM-dd');
+
+      const [total, won, inProgress, followUps] = await Promise.allSettled([
+        base(),
+        base().eq('current_status', 'Deal closed'),
+        base()
+          .not('current_status', 'in', '("Deal closed","Not interested (on call)","After session joined not interested","new")')
+          .not('current_status', 'is', null),
+        base().lte('follow_up_date', today).not('follow_up_date', 'is', null),
+      ]);
+
+      const countOf = (r: PromiseSettledResult<{ count: number | null }>) =>
+        r.status === 'fulfilled' ? (r.value.count ?? 0) : 0;
+
+      return {
+        total:      countOf(total),
+        won:        countOf(won),
+        inProgress: countOf(inProgress),
+        followUps:  countOf(followUps),
+      };
+    },
+  });
+
   const { data: employees = [] } = useQuery<Employee[]>({
     queryKey: ['profiles-for-leads'],
     enabled: isAdminOrAbove,
@@ -197,7 +265,10 @@ export default function Leads() {
   );
 
   // ---------- Mutations ----------
-  const refetchLeads = () => queryClient.invalidateQueries({ queryKey: ['leads'] });
+  const refetchLeads = () => {
+    queryClient.invalidateQueries({ queryKey: ['leads'] });
+    queryClient.invalidateQueries({ queryKey: ['lead-kpis'] });
+  };
 
   const assignLeads = async () => {
     if (!assignTo || selectedLeads.size === 0) return;
@@ -288,8 +359,152 @@ export default function Leads() {
     setPage(0);
   };
 
+  // Grouping for Kanban / Funnel views — computed from whatever the current
+  // filtered page returned (no extra query, so switching views is instant).
+  const stageBuckets = useMemo(() => {
+    return PIPELINE_STAGES.map(stage => ({
+      ...stage,
+      items: leads.filter(stage.match),
+    }));
+  }, [leads]);
+
+  const funnelMax = Math.max(1, ...stageBuckets.map(s => s.items.length));
+
+  // ---------- Render helpers ----------
+  const renderLeadRow = (lead: Lead, idx: number) => (
+    <Card
+      key={lead.id}
+      className="hover:shadow-md transition-shadow cursor-pointer"
+      onClick={() => navigate(`/leads/${lead.id}`)}
+    >
+      <CardContent className="flex items-center gap-3 py-3">
+        {isAdminOrAbove && (
+          <Checkbox
+            checked={selectedLeads.has(lead.id)}
+            onCheckedChange={() => toggleSelect(lead.id)}
+            onClick={e => e.stopPropagation()}
+          />
+        )}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-medium text-sm">{lead.name}</span>
+            <Badge variant="outline" className={statusColor(lead.current_status)}>
+              {lead.current_status || 'New'}
+            </Badge>
+            {lead.custom_fields?.priority && (
+              <Badge variant="outline" className="bg-amber-500/10 text-amber-600 text-[10px]">
+                {lead.custom_fields.priority}
+              </Badge>
+            )}
+            {isAdminOrAbove && (
+              <Badge variant="outline" className="bg-muted text-muted-foreground text-[10px]">
+                {employeeName(lead.assigned_to)}
+              </Badge>
+            )}
+          </div>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            {lead.phone} {lead.source ? `• ${lead.source}` : ''}
+          </p>
+        </div>
+        <div className="flex items-center gap-1">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-8 w-8 text-green-600 hover:text-green-700 hover:bg-green-500/10"
+            title="WhatsApp"
+            onClick={e => {
+              e.stopPropagation();
+              window.open(
+                `https://wa.me/${normalizePhoneForWa(lead.phone)}?text=Hello ${encodeURIComponent(lead.name)}`,
+                '_blank',
+              );
+            }}
+          >
+            <MessageCircle className="w-4 h-4" />
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={e => { e.stopPropagation(); setDispositionLeadIdx(idx); }}
+          >
+            <Phone className="w-3.5 h-3.5 mr-1" /> Log Call
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const renderKanbanCard = (lead: Lead, idx: number) => (
+    <Card
+      key={lead.id}
+      className="cursor-pointer hover:shadow-md transition-shadow"
+      onClick={() => navigate(`/leads/${lead.id}`)}
+    >
+      <CardContent className="p-3 space-y-2">
+        <div className="flex items-start gap-2">
+          {isAdminOrAbove && (
+            <Checkbox
+              checked={selectedLeads.has(lead.id)}
+              onCheckedChange={() => toggleSelect(lead.id)}
+              onClick={e => e.stopPropagation()}
+              className="mt-0.5"
+            />
+          )}
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium truncate">{lead.name}</p>
+            <p className="text-xs text-muted-foreground truncate">{lead.phone}</p>
+          </div>
+          {lead.custom_fields?.priority && (
+            <Badge variant="outline" className="bg-amber-500/10 text-amber-600 text-[10px]">
+              {lead.custom_fields.priority}
+            </Badge>
+          )}
+        </div>
+        {lead.source && (
+          <p className="text-[10px] text-muted-foreground">Source: {lead.source}</p>
+        )}
+        <div className="flex items-center justify-between pt-1">
+          <Badge variant="outline" className={cn('text-[10px]', statusColor(lead.current_status))}>
+            {lead.current_status || 'New'}
+          </Badge>
+          <div className="flex items-center gap-1">
+            <Button
+              size="icon" variant="ghost"
+              className="h-7 w-7 text-green-600 hover:bg-green-500/10"
+              onClick={e => {
+                e.stopPropagation();
+                window.open(`https://wa.me/${normalizePhoneForWa(lead.phone)}?text=Hello ${encodeURIComponent(lead.name)}`, '_blank');
+              }}
+            >
+              <MessageCircle className="w-3.5 h-3.5" />
+            </Button>
+            <Button
+              size="icon" variant="ghost"
+              className="h-7 w-7"
+              title="Log Call"
+              onClick={e => { e.stopPropagation(); setDispositionLeadIdx(idx); }}
+            >
+              <Phone className="w-3.5 h-3.5" />
+            </Button>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  // ---------- KPI cards ----------
+  const kpiCards = [
+    { key: 'total',      label: 'Total Leads',  value: kpis?.total      ?? totalCount, icon: Users,      color: 'text-primary',     bg: 'bg-primary/10' },
+    { key: 'won',        label: 'Won',          value: kpis?.won        ?? 0,          icon: Trophy,     color: 'text-emerald-500', bg: 'bg-emerald-500/10' },
+    { key: 'inProgress', label: 'In Progress',  value: kpis?.inProgress ?? 0,          icon: CircleDot,  color: 'text-blue-500',    bg: 'bg-blue-500/10' },
+    { key: 'followUps',  label: 'Follow-ups',   value: kpis?.followUps  ?? 0,          icon: Flame,      color: 'text-amber-500',   bg: 'bg-amber-500/10' },
+  ];
+
   return (
     <div>
+      {/* ══════════════════════════════════════════════════════════════════════
+          KPI CARDS — must not be removed (see top-of-file directive).
+         ══════════════════════════════════════════════════════════════════════ */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
         <h1 className="text-2xl font-bold">{isAdminOrAbove ? 'All Leads' : 'My Leads'}</h1>
         <div className="relative w-full sm:w-64">
@@ -303,7 +518,68 @@ export default function Leads() {
         </div>
       </div>
 
-      {/* Filter Bar */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+        {kpiCards.map(k => (
+          <Card key={k.key}>
+            <CardContent className="p-4 flex items-center gap-3">
+              <div className={cn('w-10 h-10 rounded-lg flex items-center justify-center shrink-0', k.bg)}>
+                <k.icon className={cn('w-5 h-5', k.color)} />
+              </div>
+              <div className="min-w-0">
+                <p className="text-xs text-muted-foreground">{k.label}</p>
+                <p className="text-xl font-bold leading-tight">{k.value.toLocaleString()}</p>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          VIEW TOGGLES + PRIORITY TABS — must not be removed.
+         ══════════════════════════════════════════════════════════════════════ */}
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <div className="inline-flex rounded-lg border bg-muted/30 p-0.5">
+          {([
+            { v: 'list',   icon: LayoutList,    label: 'List' },
+            { v: 'kanban', icon: KanbanSquare,  label: 'Kanban' },
+            { v: 'funnel', icon: FunnelIcon,    label: 'Funnel' },
+          ] as const).map(({ v, icon: Icon, label }) => (
+            <button
+              key={v}
+              onClick={() => setView(v)}
+              className={cn(
+                'px-3 py-1.5 text-xs font-medium rounded-md flex items-center gap-1.5 transition-colors',
+                view === v
+                  ? 'bg-background shadow-sm text-foreground'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              <Icon className="w-3.5 h-3.5" /> {label}
+            </button>
+          ))}
+        </div>
+
+        <div className="inline-flex rounded-lg border bg-muted/30 p-0.5 ml-1">
+          {PRIORITIES.map(p => (
+            <button
+              key={p.value}
+              onClick={() => { setPriority(p.value); setPage(0); }}
+              className={cn(
+                'px-3 py-1.5 text-xs font-medium rounded-md transition-colors',
+                priority === p.value
+                  ? 'bg-background shadow-sm text-foreground'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          FILTER BAR — school-sales-buddy multi-select filters (preserved).
+         ══════════════════════════════════════════════════════════════════════ */}
       <div className="flex flex-wrap items-center gap-2 mb-4">
         <Filter className="w-4 h-4 text-muted-foreground" />
 
@@ -450,7 +726,9 @@ export default function Leads() {
         </Select>
       </div>
 
-      {/* Admin bulk actions */}
+      {/* ══════════════════════════════════════════════════════════════════════
+          BULK ACTION BAR — school-sales-buddy (preserved).
+         ══════════════════════════════════════════════════════════════════════ */}
       {isAdminOrAbove && selectedLeads.size > 0 && (
         <Card className="mb-4">
           <CardContent className="flex flex-col sm:flex-row items-start sm:items-center gap-3 py-3">
@@ -476,6 +754,9 @@ export default function Leads() {
         </Card>
       )}
 
+      {/* ══════════════════════════════════════════════════════════════════════
+          BODY: List / Kanban / Funnel
+         ══════════════════════════════════════════════════════════════════════ */}
       {isLoading ? (
         <div className="space-y-2">
           {Array.from({ length: 8 }).map((_, i) => (
@@ -493,7 +774,7 @@ export default function Leads() {
         </div>
       ) : leads.length === 0 ? (
         <Card><CardContent className="py-12 text-center text-muted-foreground">No leads found</CardContent></Card>
-      ) : (
+      ) : view === 'list' ? (
         <>
           {isAdminOrAbove && (
             <div className="flex items-center gap-2 mb-2 px-1">
@@ -506,63 +787,7 @@ export default function Leads() {
           )}
 
           <div className="space-y-2">
-            {leads.map((lead, idx) => (
-              <Card
-                key={lead.id}
-                className="hover:shadow-md transition-shadow cursor-pointer"
-                onClick={() => navigate(`/leads/${lead.id}`)}
-              >
-                <CardContent className="flex items-center gap-3 py-3">
-                  {isAdminOrAbove && (
-                    <Checkbox
-                      checked={selectedLeads.has(lead.id)}
-                      onCheckedChange={() => toggleSelect(lead.id)}
-                      onClick={e => e.stopPropagation()}
-                    />
-                  )}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-medium text-sm">{lead.name}</span>
-                      <Badge variant="outline" className={statusColor(lead.current_status)}>
-                        {lead.current_status || 'New'}
-                      </Badge>
-                      {isAdminOrAbove && (
-                        <Badge variant="outline" className="bg-muted text-muted-foreground text-[10px]">
-                          {employeeName(lead.assigned_to)}
-                        </Badge>
-                      )}
-                    </div>
-                    <p className="text-xs text-muted-foreground mt-0.5">
-                      {lead.phone} {lead.source ? `• ${lead.source}` : ''}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-8 w-8 text-green-600 hover:text-green-700 hover:bg-green-50"
-                      title="WhatsApp"
-                      onClick={e => {
-                        e.stopPropagation();
-                        window.open(
-                          `https://wa.me/${normalizePhoneForWa(lead.phone)}?text=Hello ${encodeURIComponent(lead.name)}`,
-                          '_blank',
-                        );
-                      }}
-                    >
-                      <MessageCircle className="w-4 h-4" />
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={e => { e.stopPropagation(); setDispositionLeadIdx(idx); }}
-                    >
-                      <Phone className="w-3.5 h-3.5 mr-1" /> Log Call
-                    </Button>
-                  </div>
-                </CardContent>
-              </Card>
-            ))}
+            {leads.map((lead, idx) => renderLeadRow(lead, idx))}
           </div>
 
           {pageSize !== 'all' && totalPages > 1 && (
@@ -579,6 +804,56 @@ export default function Leads() {
             </div>
           )}
         </>
+      ) : view === 'kanban' ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6 gap-3">
+          {stageBuckets.map(stage => (
+            <div key={stage.key} className="bg-muted/20 border rounded-lg p-2 min-h-40 space-y-2">
+              <div className="flex items-center justify-between px-1 py-0.5">
+                <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  {stage.label}
+                </span>
+                <Badge variant="outline" className="text-[10px]">{stage.items.length}</Badge>
+              </div>
+              <div className="space-y-2">
+                {stage.items.length === 0 ? (
+                  <p className="text-[11px] text-muted-foreground text-center py-4">No leads</p>
+                ) : (
+                  stage.items.map(l => renderKanbanCard(l, leads.findIndex(x => x.id === l.id)))
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        /* Funnel view */
+        <Card>
+          <CardContent className="p-4 space-y-2">
+            {stageBuckets.map(stage => {
+              const pct = Math.round((stage.items.length / funnelMax) * 100);
+              return (
+                <div key={stage.key} className="flex items-center gap-3">
+                  <div className="w-24 text-xs font-medium text-muted-foreground shrink-0">
+                    {stage.label}
+                  </div>
+                  <div className="flex-1 h-8 bg-muted/40 rounded overflow-hidden">
+                    <div
+                      className="h-full bg-primary/80 transition-all flex items-center px-2 text-[11px] font-medium text-primary-foreground"
+                      style={{ width: `${Math.max(pct, 4)}%` }}
+                    >
+                      {stage.items.length > 0 && stage.items.length}
+                    </div>
+                  </div>
+                  <div className="w-10 text-right text-xs font-semibold tabular-nums">
+                    {stage.items.length}
+                  </div>
+                </div>
+              );
+            })}
+            <p className="text-[11px] text-muted-foreground pt-2 border-t mt-3">
+              Funnel is computed from the current page's {leads.length} lead{leads.length === 1 ? '' : 's'} — apply filters or raise the page size to widen the slice.
+            </p>
+          </CardContent>
+        </Card>
       )}
 
       {dispositionLead && (
