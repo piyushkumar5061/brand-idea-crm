@@ -311,9 +311,32 @@ export default function Leads() {
     next.has(id) ? next.delete(id) : next.add(id);
     setSelectedLeads(next);
   };
+  /** Toggle "select every lead currently visible" (the filtered page). */
   const toggleSelectAll = () => {
     if (selectedLeads.size === leads.length) setSelectedLeads(new Set());
     else setSelectedLeads(new Set(leads.map(l => l.id)));
+  };
+  /** Clear selection. Safe to call when nothing is selected. */
+  const deselectAll = () => setSelectedLeads(new Set());
+  /**
+   * Add (or remove) every lead in one Kanban / Funnel stage to the selection.
+   * If every lead in the stage is already selected → deselect them;
+   * otherwise → union into the current selection (doesn't clobber other stages).
+   */
+  const toggleSelectStage = (stageItems: Lead[]) => {
+    const ids = stageItems.map(l => l.id);
+    const allSelected = ids.length > 0 && ids.every(id => selectedLeads.has(id));
+    const next = new Set(selectedLeads);
+    if (allSelected) ids.forEach(id => next.delete(id));
+    else ids.forEach(id => next.add(id));
+    setSelectedLeads(next);
+  };
+  /** Bulk delete with confirm guard — shared by every view. */
+  const confirmAndBulkDelete = async () => {
+    if (selectedLeads.size === 0) return;
+    const ok = window.confirm(`Delete ${selectedLeads.size} lead${selectedLeads.size === 1 ? '' : 's'}? This cannot be undone.`);
+    if (!ok) return;
+    await deleteSelected();
   };
 
   const sources = useMemo(() => {
@@ -727,7 +750,50 @@ export default function Leads() {
       </div>
 
       {/* ══════════════════════════════════════════════════════════════════════
-          BULK ACTION BAR — school-sales-buddy (preserved).
+          SELECTION TOOLBAR — Select All / Deselect All visible in EVERY view
+          (List, Kanban, Funnel) so bulk-delete works regardless of layout.
+         ══════════════════════════════════════════════════════════════════════ */}
+      {isAdminOrAbove && leads.length > 0 && (
+        <div className="flex flex-wrap items-center gap-3 mb-3 px-1">
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <Checkbox
+              checked={selectedLeads.size === leads.length && leads.length > 0}
+              onCheckedChange={toggleSelectAll}
+            />
+            <span className="text-xs font-medium text-muted-foreground">
+              {selectedLeads.size === leads.length ? 'Deselect all' : 'Select all'}
+              {leads.length > 0 && ` (${leads.length})`}
+            </span>
+          </label>
+
+          <span className="text-xs text-muted-foreground">
+            {selectedLeads.size > 0
+              ? `${selectedLeads.size} selected`
+              : 'No leads selected'}
+          </span>
+
+          {selectedLeads.size > 0 && (
+            <>
+              <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={deselectAll}>
+                <X className="w-3 h-3 mr-1" /> Clear selection
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                className="h-7 text-xs ml-auto"
+                onClick={confirmAndBulkDelete}
+                disabled={deleting}
+              >
+                <Trash2 className="w-3 h-3 mr-1" />
+                {deleting ? 'Deleting…' : `Delete ${selectedLeads.size}`}
+              </Button>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          BULK ACTION BAR — school-sales-buddy (preserved) + Deselect All.
          ══════════════════════════════════════════════════════════════════════ */}
       {isAdminOrAbove && selectedLeads.size > 0 && (
         <Card className="mb-4">
@@ -747,8 +813,11 @@ export default function Leads() {
             <Button size="sm" variant="outline" onClick={bulkWhatsApp}>
               <MessageCircle className="w-3.5 h-3.5 mr-1" /> Bulk WhatsApp
             </Button>
-            <Button size="sm" variant="destructive" onClick={deleteSelected} disabled={deleting}>
+            <Button size="sm" variant="destructive" onClick={confirmAndBulkDelete} disabled={deleting}>
               <Trash2 className="w-3.5 h-3.5 mr-1" /> {deleting ? 'Deleting...' : 'Delete'}
+            </Button>
+            <Button size="sm" variant="ghost" className="sm:ml-auto" onClick={deselectAll}>
+              <X className="w-3.5 h-3.5 mr-1" /> Deselect all
             </Button>
           </CardContent>
         </Card>
@@ -776,16 +845,7 @@ export default function Leads() {
         <Card><CardContent className="py-12 text-center text-muted-foreground">No leads found</CardContent></Card>
       ) : view === 'list' ? (
         <>
-          {isAdminOrAbove && (
-            <div className="flex items-center gap-2 mb-2 px-1">
-              <Checkbox
-                checked={selectedLeads.size === leads.length && leads.length > 0}
-                onCheckedChange={toggleSelectAll}
-              />
-              <span className="text-xs text-muted-foreground">Select All</span>
-            </div>
-          )}
-
+          {/* Select-all lives in the persistent toolbar above — no duplicate here. */}
           <div className="space-y-2">
             {leads.map((lead, idx) => renderLeadRow(lead, idx))}
           </div>
@@ -806,23 +866,36 @@ export default function Leads() {
         </>
       ) : view === 'kanban' ? (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6 gap-3">
-          {stageBuckets.map(stage => (
-            <div key={stage.key} className="bg-muted/20 border rounded-lg p-2 min-h-40 space-y-2">
-              <div className="flex items-center justify-between px-1 py-0.5">
-                <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  {stage.label}
-                </span>
-                <Badge variant="outline" className="text-[10px]">{stage.items.length}</Badge>
+          {stageBuckets.map(stage => {
+            const allStageSelected =
+              stage.items.length > 0 && stage.items.every(l => selectedLeads.has(l.id));
+            return (
+              <div key={stage.key} className="bg-muted/20 border rounded-lg p-2 min-h-40 space-y-2">
+                <div className="flex items-center justify-between px-1 py-0.5 gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    {isAdminOrAbove && stage.items.length > 0 && (
+                      <Checkbox
+                        checked={allStageSelected}
+                        onCheckedChange={() => toggleSelectStage(stage.items)}
+                        title={allStageSelected ? 'Deselect stage' : 'Select stage'}
+                      />
+                    )}
+                    <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground truncate">
+                      {stage.label}
+                    </span>
+                  </div>
+                  <Badge variant="outline" className="text-[10px] shrink-0">{stage.items.length}</Badge>
+                </div>
+                <div className="space-y-2">
+                  {stage.items.length === 0 ? (
+                    <p className="text-[11px] text-muted-foreground text-center py-4">No leads</p>
+                  ) : (
+                    stage.items.map(l => renderKanbanCard(l, leads.findIndex(x => x.id === l.id)))
+                  )}
+                </div>
               </div>
-              <div className="space-y-2">
-                {stage.items.length === 0 ? (
-                  <p className="text-[11px] text-muted-foreground text-center py-4">No leads</p>
-                ) : (
-                  stage.items.map(l => renderKanbanCard(l, leads.findIndex(x => x.id === l.id)))
-                )}
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       ) : (
         /* Funnel view */
@@ -830,8 +903,18 @@ export default function Leads() {
           <CardContent className="p-4 space-y-2">
             {stageBuckets.map(stage => {
               const pct = Math.round((stage.items.length / funnelMax) * 100);
+              const allStageSelected =
+                stage.items.length > 0 && stage.items.every(l => selectedLeads.has(l.id));
               return (
                 <div key={stage.key} className="flex items-center gap-3">
+                  {isAdminOrAbove && (
+                    <Checkbox
+                      checked={allStageSelected}
+                      onCheckedChange={() => toggleSelectStage(stage.items)}
+                      disabled={stage.items.length === 0}
+                      title={allStageSelected ? 'Deselect stage' : 'Select stage'}
+                    />
+                  )}
                   <div className="w-24 text-xs font-medium text-muted-foreground shrink-0">
                     {stage.label}
                   </div>
@@ -851,6 +934,7 @@ export default function Leads() {
             })}
             <p className="text-[11px] text-muted-foreground pt-2 border-t mt-3">
               Funnel is computed from the current page's {leads.length} lead{leads.length === 1 ? '' : 's'} — apply filters or raise the page size to widen the slice.
+              {isAdminOrAbove && ' Use the checkboxes to bulk-select a stage, then delete from the selection toolbar.'}
             </p>
           </CardContent>
         </Card>
