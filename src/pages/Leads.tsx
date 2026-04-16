@@ -24,8 +24,40 @@ import {
   Phone, Search, Filter, X, Trash2, ChevronLeft, ChevronRight,
   MessageCircle, Users, SlidersHorizontal, CalendarIcon, AlertTriangle,
   LayoutList, KanbanSquare, Filter as FunnelIcon, Trophy, Flame,
-  CircleDot,
+  CircleDot, Database, RefreshCw,
 } from 'lucide-react';
+
+/**
+ * Hard timeout wrapper for any PromiseLike. If the underlying promise hasn't
+ * resolved by `ms`, we reject with a diagnostic Error. Required because
+ * Supabase's JS client will happily hang forever when a relation is missing
+ * or an RLS recursion blocks the connection — React Query's default is no
+ * timeout, so isLoading stays true until the user closes the tab.
+ */
+function withTimeout<T>(p: PromiseLike<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`[${label}] timed out after ${ms}ms — the table may be missing or RLS is blocking the query.`)),
+      ms,
+    );
+    Promise.resolve(p).then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+/**
+ * Heuristic: does this Supabase error mean "the table literally doesn't exist"?
+ * Postgres returns error code 42P01 / message includes "relation … does not exist".
+ * We surface a different, more actionable empty-state for this case.
+ */
+function isMissingRelationError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: string }).code ?? '';
+  return code === '42P01' || /relation .* does not exist/i.test(msg);
+}
 
 interface Lead {
   id: string;
@@ -149,9 +181,15 @@ export default function Leads() {
       role: isAdminOrAbove ? 'admin' : 'employee', userId: user?.id ?? null },
   ];
 
-  const { data: leadsData, isLoading } = useQuery({
+  const LEADS_QUERY_TIMEOUT_MS = 7000;
+
+  const { data: leadsData, isLoading, isError, error: leadsError, refetch } = useQuery({
     queryKey: leadsQueryKey,
     placeholderData: keepPreviousData,
+    // React Query's defaults would retry a hung request 3 times — that turns a
+    // 7 s timeout into a ~30 s spinner trap. One retry is plenty.
+    retry: 1,
+    retryDelay: 500,
     queryFn: async () => {
       let query = supabase
         .from('leads')
@@ -204,8 +242,14 @@ export default function Leads() {
         query = query.range(from, to);
       }
 
-      const { data, count, error } = await query;
-      if (error) throw error;
+      // Bounded: if the request hangs (missing table, RLS recursion, network
+      // hiccup) we reject after LEADS_QUERY_TIMEOUT_MS instead of spinning
+      // forever. React Query will then flip isError=true and isLoading=false.
+      const { data, count, error } = await withTimeout(query, LEADS_QUERY_TIMEOUT_MS, 'leads');
+      if (error) {
+        console.error('[Leads] supabase error:', error);
+        throw error;
+      }
       return { rows: (data as Lead[]) ?? [], total: count ?? 0 };
     },
   });
@@ -213,10 +257,14 @@ export default function Leads() {
   const leads = leadsData?.rows ?? [];
   const totalCount = leadsData?.total ?? 0;
 
-  // ── KPI query: runs four parallel counts, role-scoped, resilient on failure.
+  // ── KPI query: four parallel counts, each with its own hard timeout.
+  //    A missing leads table will reject all four identically; the cards
+  //    render as 0 and the error state in the body explains why.
   const { data: kpis } = useQuery({
     queryKey: ['lead-kpis', { role: isAdminOrAbove ? 'admin' : 'employee', userId: user?.id ?? null }],
     enabled: !!user,
+    retry: 1,
+    retryDelay: 500,
     queryFn: async () => {
       const base = () => {
         let q = supabase.from('leads').select('id', { count: 'exact', head: true });
@@ -224,25 +272,36 @@ export default function Leads() {
         return q;
       };
       const today = formatDate(new Date(), 'yyyy-MM-dd');
+      const KPI_TIMEOUT_MS = 5000;
 
-      const [total, won, inProgress, followUps] = await Promise.allSettled([
-        base(),
-        base().eq('current_status', 'Deal closed'),
-        base()
+      const countOrZero = async (
+        label: string,
+        build: () => PromiseLike<{ count: number | null; error: unknown }>,
+      ): Promise<number> => {
+        try {
+          const { count, error } = await withTimeout(build(), KPI_TIMEOUT_MS, label);
+          if (error) {
+            console.error(`[Leads/kpi:${label}] supabase error:`, error);
+            return 0;
+          }
+          return count ?? 0;
+        } catch (e) {
+          console.error(`[Leads/kpi:${label}] threw:`, e);
+          return 0;
+        }
+      };
+
+      const [total, won, inProgress, followUps] = await Promise.all([
+        countOrZero('total', () => base()),
+        countOrZero('won',   () => base().eq('current_status', 'Deal closed')),
+        countOrZero('inProgress', () => base()
           .not('current_status', 'in', '("Deal closed","Not interested (on call)","After session joined not interested","new")')
           .not('current_status', 'is', null),
-        base().lte('follow_up_date', today).not('follow_up_date', 'is', null),
+        ),
+        countOrZero('followUps', () => base().lte('follow_up_date', today).not('follow_up_date', 'is', null)),
       ]);
 
-      const countOf = (r: PromiseSettledResult<{ count: number | null }>) =>
-        r.status === 'fulfilled' ? (r.value.count ?? 0) : 0;
-
-      return {
-        total:      countOf(total),
-        won:        countOf(won),
-        inProgress: countOf(inProgress),
-        followUps:  countOf(followUps),
-      };
+      return { total, won, inProgress, followUps };
     },
   });
 
@@ -825,8 +884,41 @@ export default function Leads() {
 
       {/* ══════════════════════════════════════════════════════════════════════
           BODY: List / Kanban / Funnel
+          State priority: ERROR > LOADING > EMPTY > view-specific render.
          ══════════════════════════════════════════════════════════════════════ */}
-      {isLoading ? (
+      {isError ? (
+        (() => {
+          const missing = isMissingRelationError(leadsError);
+          const msg = leadsError instanceof Error ? leadsError.message : String(leadsError);
+          return (
+            <Card className="border-destructive/40">
+              <CardContent className="py-10 px-6 text-center space-y-3">
+                <div className="mx-auto w-12 h-12 rounded-xl bg-destructive/10 flex items-center justify-center">
+                  {missing ? <Database className="w-6 h-6 text-destructive" /> : <AlertTriangle className="w-6 h-6 text-destructive" />}
+                </div>
+                <div className="space-y-1">
+                  <h3 className="font-semibold">
+                    {missing ? 'Leads table not found' : 'Couldn\'t load leads'}
+                  </h3>
+                  <p className="text-sm text-muted-foreground max-w-lg mx-auto">
+                    {missing
+                      ? 'The public.leads table doesn\'t exist in this Supabase project yet. Run the setup SQL (in the project docs) in the Supabase SQL Editor — then hit Retry.'
+                      : 'Supabase returned an error or the request timed out. The full message is below, and in the browser console.'}
+                  </p>
+                </div>
+                <pre className="text-[11px] bg-muted/40 rounded p-2 max-w-xl mx-auto text-left overflow-auto">
+                  {msg}
+                </pre>
+                <div className="flex items-center justify-center gap-2">
+                  <Button size="sm" variant="outline" onClick={() => refetch()}>
+                    <RefreshCw className="w-3.5 h-3.5 mr-1" /> Retry
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          );
+        })()
+      ) : isLoading ? (
         <div className="space-y-2">
           {Array.from({ length: 8 }).map((_, i) => (
             <Card key={i}>
@@ -842,7 +934,26 @@ export default function Leads() {
           ))}
         </div>
       ) : leads.length === 0 ? (
-        <Card><CardContent className="py-12 text-center text-muted-foreground">No leads found</CardContent></Card>
+        <Card>
+          <CardContent className="py-12 text-center space-y-3">
+            <div className="mx-auto w-12 h-12 rounded-xl bg-muted flex items-center justify-center">
+              <Users className="w-6 h-6 text-muted-foreground" />
+            </div>
+            <div className="space-y-1">
+              <p className="font-medium">No leads yet</p>
+              <p className="text-sm text-muted-foreground">
+                {hasActiveFilters
+                  ? 'Nothing matches the current filters. Try clearing them.'
+                  : 'Import a CSV from the CSV Upload page or create a lead to get started.'}
+              </p>
+            </div>
+            {hasActiveFilters && (
+              <Button size="sm" variant="outline" onClick={clearAllFilters}>
+                <X className="w-3.5 h-3.5 mr-1" /> Clear all filters
+              </Button>
+            )}
+          </CardContent>
+        </Card>
       ) : view === 'list' ? (
         <>
           {/* Select-all lives in the persistent toolbar above — no duplicate here. */}
