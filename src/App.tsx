@@ -21,8 +21,9 @@ import Settings from "@/pages/Settings";
 const queryClient = new QueryClient();
 
 // ---------------------------------------------------------------------------
-// Shared loading skeleton used by all route guards
+// Helpers
 // ---------------------------------------------------------------------------
+
 function LoadingScreen() {
   return (
     <div className="min-h-screen flex items-center justify-center text-muted-foreground">
@@ -31,18 +32,23 @@ function LoadingScreen() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// RootRoute — public landing page for visitors; redirect to CRM if authed
-// ---------------------------------------------------------------------------
 /**
- * brandideaonline.com "/" serves dual purpose:
- *   - Unauthenticated visitor  → marketing landing page
- *   - Authenticated employee   → bounce to /dashboard (avoids exposing landing to staff)
+ * Returns true if the user should bypass the approval gate.
  *
- * We bypass the status check here deliberately: an authenticated-but-pending
- * user still gets redirected to /dashboard so ProtectedRoute can show the
- * "Awaiting Approval" screen with a proper sign-out option.
+ * TWO independent checks are intentional — either one alone is enough:
+ *  1. email match  — works even if the profiles row is missing / RLS-blocked
+ *  2. role match   — works even if user.email is undefined (rare OAuth edge case)
+ *
+ * This ensures the super-admin can NEVER be permanently locked out by a DB issue.
  */
+function isAutoApproved(userEmail: string | undefined, role: string | null): boolean {
+  const FOUNDER_EMAIL = 'piyushkumar5061@gmail.com';
+  return userEmail === FOUNDER_EMAIL || role === 'super_admin';
+}
+
+// ---------------------------------------------------------------------------
+// RootRoute — public landing page / smart redirect
+// ---------------------------------------------------------------------------
 function RootRoute() {
   const { user, loading } = useAuth();
   if (loading) return <LoadingScreen />;
@@ -51,43 +57,53 @@ function RootRoute() {
 }
 
 // ---------------------------------------------------------------------------
-// ProtectedRoute — gate for all CRM routes
+// ProtectedRoute — single source of truth for CRM access
 // ---------------------------------------------------------------------------
 /**
- * Three-layer guard:
- *   1. No session              → /login
- *   2. session + status=pending|suspended → PendingApproval / Suspended page
- *   3. session + status=approved + adminOnly violation → /dashboard
+ * Access decision matrix:
  *
- * Edge-case: profile row missing (trigger lag / schema not applied)
- * - role === null && profileStatus === null after loading → treat as pending
- * - EXCEPT for the known founder email, which bypasses status gate as a
- *   last resort to prevent total lockout if the DB is misconfigured.
+ *  State                                    │ Result
+ *  ─────────────────────────────────────────┼──────────────────────────────
+ *  loading = true                           │ spinner (never block early)
+ *  no session                               │ → /login
+ *  status = 'suspended'                     │ Suspended screen
+ *  status = 'approved'                      │ ✅ enter CRM
+ *  role   = 'super_admin'  (auto-approved)  │ ✅ enter CRM (bypass)
+ *  email  = founder email  (auto-approved)  │ ✅ enter CRM (bypass)
+ *  status = 'pending' OR null               │ Awaiting Approval screen
+ *    (null = DB timed-out or row missing)   │
+ *
+ * The suspended check runs BEFORE the auto-approved check so a suspended
+ * super_admin still sees the right screen (admin would fix via SQL directly).
  */
-function ProtectedRoute({ children, adminOnly = false }: { children: React.ReactNode; adminOnly?: boolean }) {
-  const { user, loading, profileStatus, isAdminOrAbove } = useAuth();
+function ProtectedRoute({ children, adminOnly = false }: {
+  children: React.ReactNode;
+  adminOnly?: boolean;
+}) {
+  const { user, loading, profileStatus, profileFetched, role, isAdminOrAbove } = useAuth();
 
-  if (loading) return <LoadingScreen />;
+  // ── 1. Still fetching — never render a gate decision while loading ───────
+  if (loading && !profileFetched) return <LoadingScreen />;
+
+  // ── 2. No session ────────────────────────────────────────────────────────
   if (!user) return <Navigate to="/login" replace />;
 
-  // Founder bypass: if DB is broken and status is null, still let them through
-  const isFounder = user.email === 'piyushkumar5061@gmail.com';
+  // ── 3. Suspended — shown even to super_admins (they must fix via SQL) ────
+  if (profileStatus === 'suspended') return <PendingApproval suspended />;
 
-  if (!isFounder) {
-    if (profileStatus === 'suspended') return <PendingApproval suspended />;
-    // null = profile row not yet created or status column missing — safe-fail to pending
-    if (profileStatus === 'pending' || profileStatus === null) return <PendingApproval />;
-  }
+  // ── 4. Gate: must be EXPLICITLY 'approved' ─ OR ─ auto-approved role/email
+  const approved = profileStatus === 'approved' || isAutoApproved(user.email, role);
+  if (!approved) return <PendingApproval />;
 
-  // adminOnly pages: redirect non-admins to dashboard rather than login
-  const hasAdminAccess = isAdminOrAbove || isFounder;
+  // ── 5. Admin-only routes ─────────────────────────────────────────────────
+  const hasAdminAccess = isAdminOrAbove || isAutoApproved(user.email, role);
   if (adminOnly && !hasAdminAccess) return <Navigate to="/dashboard" replace />;
 
   return <AppLayout>{children}</AppLayout>;
 }
 
 // ---------------------------------------------------------------------------
-// AuthRoute — prevent already-signed-in users from seeing /login
+// AuthRoute — stop already-logged-in users from seeing /login
 // ---------------------------------------------------------------------------
 function AuthRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -107,11 +123,11 @@ const App = () => (
       <BrowserRouter>
         <AuthProvider>
           <Routes>
-            {/* ── Public ────────────────────────────────────────────────── */}
-            <Route path="/" element={<RootRoute />} />
+            {/* Public */}
+            <Route path="/"      element={<RootRoute />} />
             <Route path="/login" element={<AuthRoute><Login /></AuthRoute>} />
 
-            {/* ── Protected CRM ─────────────────────────────────────────── */}
+            {/* Protected CRM — requires approved profile */}
             <Route path="/dashboard"  element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
             <Route path="/leads"      element={<ProtectedRoute><Leads /></ProtectedRoute>} />
             <Route path="/leads/:id"  element={<ProtectedRoute><LeadDetail /></ProtectedRoute>} />
@@ -119,12 +135,12 @@ const App = () => (
             <Route path="/attendance" element={<ProtectedRoute><Attendance /></ProtectedRoute>} />
             <Route path="/settings"   element={<ProtectedRoute><Settings /></ProtectedRoute>} />
 
-            {/* ── Admin-only CRM ────────────────────────────────────────── */}
+            {/* Admin-only CRM */}
             <Route path="/upload"  element={<ProtectedRoute adminOnly><CsvUpload /></ProtectedRoute>} />
             <Route path="/team"    element={<ProtectedRoute adminOnly><Team /></ProtectedRoute>} />
             <Route path="/reports" element={<ProtectedRoute adminOnly><Reports /></ProtectedRoute>} />
 
-            {/* ── Fallback: unknown URLs → public root ──────────────────── */}
+            {/* Fallback */}
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </AuthProvider>
