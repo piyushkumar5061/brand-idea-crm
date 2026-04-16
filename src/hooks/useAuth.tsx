@@ -59,44 +59,60 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   /**
    * Fetches role + status from public.profiles in a single query.
    * Uses the typed client (no `as any`) now that types.ts includes role + status.
-   * Always returns {fetched: true} — even on error — so guards can stop waiting.
+   * Always returns {fetched: true} — even on error or timeout — so guards can stop waiting.
+   *
+   * Per-query timeout (4s) guarantees we never hang on a wedged RLS recursion
+   * or an unreachable DB. Loading state always resolves to "done, null role".
    */
   const fetchProfile = useCallback(async (userId: string): Promise<ProfileData> => {
-    try {
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('role, status')
-        .eq('user_id', userId)
-        .maybeSingle();
+    const PROFILE_TIMEOUT_MS = 4000;
+    const timeoutPromise = new Promise<ProfileData>((resolve) =>
+      setTimeout(() => {
+        console.warn(`[useAuth] profile fetch timed out after ${PROFILE_TIMEOUT_MS}ms — proceeding with null role`);
+        resolve({ role: null, status: null, fetched: true });
+      }, PROFILE_TIMEOUT_MS)
+    );
 
-      if (error) {
-        // Most likely cause: RLS blocking the row OR profiles table doesn't exist.
-        console.error(
-          '[useAuth] profiles SELECT error — table may not exist or RLS is blocking it.\n' +
-          'Run brand_idea_init.sql in Supabase SQL Editor. Error:', error.message
-        );
+    const queryPromise: Promise<ProfileData> = (async () => {
+      try {
+        const { data, error } = await supabase
+          .from('profiles')
+          .select('role, status')
+          .eq('user_id', userId)
+          .maybeSingle();
+
+        if (error) {
+          // Most likely cause: RLS blocking the row OR profiles table doesn't exist.
+          console.error(
+            '[useAuth] profiles SELECT error — table may not exist or RLS is blocking it.\n' +
+            'Run brand_idea_init.sql in Supabase SQL Editor. Error:', error.message
+          );
+          return { role: null, status: null, fetched: true };
+        }
+
+        if (!data) {
+          // Authenticated but no profile row — trigger hasn't run yet, or schema not applied.
+          console.warn(
+            '[useAuth] No profiles row found for user', userId,
+            '— INSERT a row via the emergency SQL or re-run brand_idea_init.sql'
+          );
+          return { role: null, status: null, fetched: true };
+        }
+
+        // ✅ Happy path: row found, cast values safely
+        const r = (data.role   as AppRole       | undefined) ?? null;
+        const s = (data.status as ProfileStatus | undefined) ?? null;
+        console.info('[useAuth] profile loaded →', { role: r, status: s, userId });
+        return { role: r, status: s, fetched: true };
+
+      } catch (e) {
+        console.error('[useAuth] fetchProfile threw an unexpected exception:', e);
         return { role: null, status: null, fetched: true };
       }
+    })();
 
-      if (!data) {
-        // Authenticated but no profile row — trigger hasn't run yet, or schema not applied.
-        console.warn(
-          '[useAuth] No profiles row found for user', userId,
-          '— INSERT a row via the emergency SQL or re-run brand_idea_init.sql'
-        );
-        return { role: null, status: null, fetched: true };
-      }
-
-      // ✅ Happy path: row found, cast values safely
-      const r = (data.role   as AppRole       | undefined) ?? null;
-      const s = (data.status as ProfileStatus | undefined) ?? null;
-      console.info('[useAuth] profile loaded →', { role: r, status: s, userId });
-      return { role: r, status: s, fetched: true };
-
-    } catch (e) {
-      console.error('[useAuth] fetchProfile threw an unexpected exception:', e);
-      return { role: null, status: null, fetched: true };
-    }
+    // Whichever resolves first wins — real data, or timeout fallback.
+    return Promise.race([queryPromise, timeoutPromise]);
   }, []);
 
   useEffect(() => {

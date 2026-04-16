@@ -17,6 +17,8 @@ import Team from "@/pages/Team";
 import Reports from "@/pages/Reports";
 import Attendance from "@/pages/Attendance";
 import Settings from "@/pages/Settings";
+import ComingSoon from "@/pages/ComingSoon";
+import { Megaphone, MailCheck, Briefcase, Target, MapPin, FileText, Shield } from "lucide-react";
 
 const queryClient = new QueryClient();
 
@@ -139,6 +141,15 @@ const App = () => (
             <Route path="/upload"  element={<ProtectedRoute adminOnly><CsvUpload /></ProtectedRoute>} />
             <Route path="/team"    element={<ProtectedRoute adminOnly><Team /></ProtectedRoute>} />
             <Route path="/reports" element={<ProtectedRoute adminOnly><Reports /></ProtectedRoute>} />
+
+            {/* Agency modules — placeholder UIs, sidebar-visible */}
+            <Route path="/marketing"       element={<ProtectedRoute><ComingSoon title="Marketing" icon={Megaphone} description="Campaigns, social calendars, and content briefs." /></ProtectedRoute>} />
+            <Route path="/email-validator" element={<ProtectedRoute><ComingSoon title="Email Validator" icon={MailCheck} description="Bulk-verify outbound lists before a send." /></ProtectedRoute>} />
+            <Route path="/projects"        element={<ProtectedRoute><ComingSoon title="Projects" icon={Briefcase} description="Client delivery workspaces and milestones." /></ProtectedRoute>} />
+            <Route path="/lead-scraper"    element={<ProtectedRoute><ComingSoon title="Lead Scraper" icon={Target} description="Automated prospect discovery pipeline." /></ProtectedRoute>} />
+            <Route path="/field-visits"    element={<ProtectedRoute><ComingSoon title="Field Visits" icon={MapPin} description="On-site check-ins with GPS + photos." /></ProtectedRoute>} />
+            <Route path="/invoices"        element={<ProtectedRoute adminOnly><ComingSoon title="Invoices" icon={FileText} description="Generate and track client billing." /></ProtectedRoute>} />
+            <Route path="/access-control"  element={<ProtectedRoute adminOnly><ComingSoon title="Access Control" icon={Shield} description="Fine-grained permission management." /></ProtectedRoute>} />
 
             {/* Fallback */}
             <Route path="*" element={<Navigate to="/" replace />} />
