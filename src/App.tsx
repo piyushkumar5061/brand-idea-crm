@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import AppLayout from "@/components/AppLayout";
 import LandingPage from "@/pages/LandingPage";
+import PendingApproval from "@/pages/PendingApproval";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Leads from "@/pages/Leads";
@@ -20,46 +21,84 @@ import Settings from "@/pages/Settings";
 const queryClient = new QueryClient();
 
 // ---------------------------------------------------------------------------
-// Route guards
+// Shared loading skeleton used by all route guards
 // ---------------------------------------------------------------------------
+function LoadingScreen() {
+  return (
+    <div className="min-h-screen flex items-center justify-center text-muted-foreground">
+      Loading…
+    </div>
+  );
+}
 
+// ---------------------------------------------------------------------------
+// RootRoute — public landing page for visitors; redirect to CRM if authed
+// ---------------------------------------------------------------------------
 /**
- * Renders the public marketing landing page for unauthenticated visitors
- * and silently redirects authenticated users into the CRM at /dashboard.
- * This lets brandideaonline.com serve BOTH marketing and CRM from one domain.
+ * brandideaonline.com "/" serves dual purpose:
+ *   - Unauthenticated visitor  → marketing landing page
+ *   - Authenticated employee   → bounce to /dashboard (avoids exposing landing to staff)
+ *
+ * We bypass the status check here deliberately: an authenticated-but-pending
+ * user still gets redirected to /dashboard so ProtectedRoute can show the
+ * "Awaiting Approval" screen with a proper sign-out option.
  */
 function RootRoute() {
   const { user, loading } = useAuth();
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center text-muted-foreground">
-        Loading...
-      </div>
-    );
-  }
+  if (loading) return <LoadingScreen />;
   if (user) return <Navigate to="/dashboard" replace />;
   return <LandingPage />;
 }
 
-/** Gate CRM routes: unauthenticated -> /login, adminOnly violation -> /dashboard. */
+// ---------------------------------------------------------------------------
+// ProtectedRoute — gate for all CRM routes
+// ---------------------------------------------------------------------------
+/**
+ * Three-layer guard:
+ *   1. No session              → /login
+ *   2. session + status=pending|suspended → PendingApproval / Suspended page
+ *   3. session + status=approved + adminOnly violation → /dashboard
+ *
+ * Edge-case: profile row missing (trigger lag / schema not applied)
+ * - role === null && profileStatus === null after loading → treat as pending
+ * - EXCEPT for the known founder email, which bypasses status gate as a
+ *   last resort to prevent total lockout if the DB is misconfigured.
+ */
 function ProtectedRoute({ children, adminOnly = false }: { children: React.ReactNode; adminOnly?: boolean }) {
-  const { user, loading, isAdminOrAbove } = useAuth();
-  if (loading) return <div className="min-h-screen flex items-center justify-center text-muted-foreground">Loading...</div>;
+  const { user, loading, profileStatus, isAdminOrAbove } = useAuth();
+
+  if (loading) return <LoadingScreen />;
   if (!user) return <Navigate to="/login" replace />;
-  // Allow access if role says admin OR if it's the known admin email (role fetch may lag)
-  const hasAdminAccess = isAdminOrAbove || user?.email === 'piyushkumar5061@gmail.com';
+
+  // Founder bypass: if DB is broken and status is null, still let them through
+  const isFounder = user.email === 'piyushkumar5061@gmail.com';
+
+  if (!isFounder) {
+    if (profileStatus === 'suspended') return <PendingApproval suspended />;
+    // null = profile row not yet created or status column missing — safe-fail to pending
+    if (profileStatus === 'pending' || profileStatus === null) return <PendingApproval />;
+  }
+
+  // adminOnly pages: redirect non-admins to dashboard rather than login
+  const hasAdminAccess = isAdminOrAbove || isFounder;
   if (adminOnly && !hasAdminAccess) return <Navigate to="/dashboard" replace />;
+
   return <AppLayout>{children}</AppLayout>;
 }
 
-/** Prevent already-signed-in users from hitting /login. */
+// ---------------------------------------------------------------------------
+// AuthRoute — prevent already-signed-in users from seeing /login
+// ---------------------------------------------------------------------------
 function AuthRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
-  if (loading) return <div className="min-h-screen flex items-center justify-center text-muted-foreground">Loading...</div>;
+  if (loading) return <LoadingScreen />;
   if (user) return <Navigate to="/dashboard" replace />;
   return <>{children}</>;
 }
 
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
 const App = () => (
   <QueryClientProvider client={queryClient}>
     <TooltipProvider>
@@ -68,22 +107,24 @@ const App = () => (
       <BrowserRouter>
         <AuthProvider>
           <Routes>
-            {/* Public */}
+            {/* ── Public ────────────────────────────────────────────────── */}
             <Route path="/" element={<RootRoute />} />
             <Route path="/login" element={<AuthRoute><Login /></AuthRoute>} />
 
-            {/* Private CRM */}
-            <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
-            <Route path="/leads" element={<ProtectedRoute><Leads /></ProtectedRoute>} />
-            <Route path="/leads/:id" element={<ProtectedRoute><LeadDetail /></ProtectedRoute>} />
-            <Route path="/call-logs" element={<ProtectedRoute><CallLogs /></ProtectedRoute>} />
-            <Route path="/upload" element={<ProtectedRoute adminOnly><CsvUpload /></ProtectedRoute>} />
-            <Route path="/team" element={<ProtectedRoute adminOnly><Team /></ProtectedRoute>} />
-            <Route path="/reports" element={<ProtectedRoute adminOnly><Reports /></ProtectedRoute>} />
+            {/* ── Protected CRM ─────────────────────────────────────────── */}
+            <Route path="/dashboard"  element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
+            <Route path="/leads"      element={<ProtectedRoute><Leads /></ProtectedRoute>} />
+            <Route path="/leads/:id"  element={<ProtectedRoute><LeadDetail /></ProtectedRoute>} />
+            <Route path="/call-logs"  element={<ProtectedRoute><CallLogs /></ProtectedRoute>} />
             <Route path="/attendance" element={<ProtectedRoute><Attendance /></ProtectedRoute>} />
-            <Route path="/settings" element={<ProtectedRoute><Settings /></ProtectedRoute>} />
+            <Route path="/settings"   element={<ProtectedRoute><Settings /></ProtectedRoute>} />
 
-            {/* Fallback: send unknown paths to the public root so marketing visitors aren't dumped on a 404. */}
+            {/* ── Admin-only CRM ────────────────────────────────────────── */}
+            <Route path="/upload"  element={<ProtectedRoute adminOnly><CsvUpload /></ProtectedRoute>} />
+            <Route path="/team"    element={<ProtectedRoute adminOnly><Team /></ProtectedRoute>} />
+            <Route path="/reports" element={<ProtectedRoute adminOnly><Reports /></ProtectedRoute>} />
+
+            {/* ── Fallback: unknown URLs → public root ──────────────────── */}
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </AuthProvider>
