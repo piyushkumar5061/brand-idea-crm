@@ -8,8 +8,10 @@ import {
 } from 'lucide-react';
 import ClockInOutButton from '@/components/ClockInOutButton';
 
+// NOTE: Dashboard now lives at /dashboard — the root path "/" is reserved for
+// the public marketing landing page (see RootRoute in App.tsx).
 const adminLinks = [
-  { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
+  { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/leads', icon: Users, label: 'Leads' },
   { to: '/call-logs', icon: Phone, label: 'Call Logs' },
   { to: '/reports', icon: BarChart3, label: 'Reports' },
@@ -20,7 +22,7 @@ const adminLinks = [
 ];
 
 const employeeLinks = [
-  { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
+  { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/leads', icon: Users, label: 'My Leads' },
   { to: '/call-logs', icon: Phone, label: 'Call Logs' },
   { to: '/attendance', icon: Clock, label: 'My Attendance' },
