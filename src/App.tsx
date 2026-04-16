@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Route, Routes, Navigate } from "react-router-dom";
+import { useEffect, useState } from "react";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -35,6 +36,25 @@ function LoadingScreen() {
 }
 
 /**
+ * Component-local escape hatch — if useAuth is STILL reporting loading=true
+ * after 3 seconds (shouldn't happen, but defense in depth), we stop rendering
+ * the spinner and render children anyway. The auth gate below will still
+ * refuse to hand out admin access, so this is safe.
+ */
+function useHardLoadingCap(active: boolean, ms = 3000): boolean {
+  const [capped, setCapped] = useState(false);
+  useEffect(() => {
+    if (!active) { setCapped(false); return; }
+    const t = setTimeout(() => {
+      console.warn(`[App] Hard loading cap hit at ${ms}ms — unblocking route render.`);
+      setCapped(true);
+    }, ms);
+    return () => clearTimeout(t);
+  }, [active, ms]);
+  return capped;
+}
+
+/**
  * Returns true if the user should bypass the approval gate.
  *
  * TWO independent checks are intentional — either one alone is enough:
@@ -53,7 +73,11 @@ function isAutoApproved(userEmail: string | undefined, role: string | null): boo
 // ---------------------------------------------------------------------------
 function RootRoute() {
   const { user, loading } = useAuth();
-  if (loading) return <LoadingScreen />;
+  const capped = useHardLoadingCap(loading);
+  // Still loading AND the hard cap hasn't fired → spinner.
+  // Once capped or loading is false → render. If we're capped without a user
+  // just show the landing page (same as logged-out).
+  if (loading && !capped) return <LoadingScreen />;
   if (user) return <Navigate to="/dashboard" replace />;
   return <LandingPage />;
 }
@@ -82,10 +106,13 @@ function ProtectedRoute({ children, adminOnly = false }: {
   children: React.ReactNode;
   adminOnly?: boolean;
 }) {
-  const { user, loading, profileStatus, profileFetched, role, isAdminOrAbove } = useAuth();
+  const { user, loading, profileStatus, role, isAdminOrAbove } = useAuth();
+  const capped = useHardLoadingCap(loading);
 
-  // ── 1. Still fetching — never render a gate decision while loading ───────
-  if (loading && !profileFetched) return <LoadingScreen />;
+  // ── 1. Still fetching — but bail after 3 s so we NEVER trap on a spinner.
+  //      The downstream checks still enforce auth correctly even if we fall
+  //      through with incomplete data (no user → /login, no status → pending).
+  if (loading && !capped) return <LoadingScreen />;
 
   // ── 2. No session ────────────────────────────────────────────────────────
   if (!user) return <Navigate to="/login" replace />;
@@ -94,6 +121,7 @@ function ProtectedRoute({ children, adminOnly = false }: {
   if (profileStatus === 'suspended') return <PendingApproval suspended />;
 
   // ── 4. Gate: must be EXPLICITLY 'approved' ─ OR ─ auto-approved role/email
+  //      Founder bypass (piyushkumar5061@gmail.com) is handled by isAutoApproved.
   const approved = profileStatus === 'approved' || isAutoApproved(user.email, role);
   if (!approved) return <PendingApproval />;
 
@@ -109,7 +137,8 @@ function ProtectedRoute({ children, adminOnly = false }: {
 // ---------------------------------------------------------------------------
 function AuthRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
-  if (loading) return <LoadingScreen />;
+  const capped = useHardLoadingCap(loading);
+  if (loading && !capped) return <LoadingScreen />;
   if (user) return <Navigate to="/dashboard" replace />;
   return <>{children}</>;
 }
