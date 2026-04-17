@@ -202,7 +202,9 @@ export default function Leads() {
       role: isAdminOrAbove ? 'admin' : 'employee', userId: user?.id ?? null },
   ];
 
-  const LEADS_QUERY_TIMEOUT_MS = 7000;
+  // Hard 5 s fuse. If Supabase hasn't answered by then, we force an error so
+  // the UI can print a message instead of spinning forever.
+  const LEADS_QUERY_TIMEOUT_MS = 5000;
 
   const { data: leadsData, isLoading, isError, error: leadsError, refetch } = useQuery({
     queryKey: leadsQueryKey,
@@ -211,14 +213,10 @@ export default function Leads() {
     // appear unauthorized because useAuth hadn't resolved yet.
     enabled: !!user,
     placeholderData: keepPreviousData,
-    // React Query's defaults would retry a hung request 3 times — that turns a
-    // 7 s timeout into a ~30 s spinner trap. One retry is plenty. Also: never
-    // retry an auth failure — it's not going to resolve by trying again.
-    retry: (failureCount, err) => {
-      if (isUnauthorizedError(err)) return false;
-      return failureCount < 1;
-    },
-    retryDelay: 500,
+    // NO retries. If Supabase rejects the read, fail instantly — retrying a
+    // schema error or an RLS denial just hides the real problem behind a
+    // longer spinner. User explicitly wants the error surfaced fast.
+    retry: false,
     queryFn: async () => {
       console.log('[Leads] 📥 Fetching leads — key:', leadsQueryKey[1]);
       let query = supabase
@@ -298,11 +296,14 @@ export default function Leads() {
   const [loadingExpired, setLoadingExpired] = useState(false);
   useEffect(() => {
     if (!isLoading) { setLoadingExpired(false); return; }
-    console.log('[Leads] ⏳ isLoading=true — arming 3 s kill switch');
+    console.log('[Leads] ⏳ isLoading=true — arming kill switch');
+    // Fires slightly after the in-query 5 s fuse so the React Query error
+    // state has a chance to propagate first. If that path silently fails,
+    // this flips the UI to the red error card anyway.
     const timer = setTimeout(() => {
-      console.warn('[Leads] 🛟 KILL SWITCH: isLoading still true after 3 s — forcing error UI');
+      console.warn('[Leads] 🛟 KILL SWITCH: isLoading still true — forcing error UI');
       setLoadingExpired(true);
-    }, 3000);
+    }, LEADS_QUERY_TIMEOUT_MS + 500);
     return () => clearTimeout(timer);
   }, [isLoading]);
 
@@ -1004,55 +1005,79 @@ export default function Leads() {
          ══════════════════════════════════════════════════════════════════════ */}
       {(isError || (isLoading && loadingExpired)) ? (
         (() => {
+          // ── Build a rich, debuggable error payload ───────────────────────
+          // Supabase's PostgrestError has { message, details, hint, code }.
+          // We surface ALL of them so the user can fix the schema without
+          // having to crack open DevTools.
           const expired = isLoading && loadingExpired && !isError;
-          const unauthorized = !expired && isUnauthorizedError(leadsError);
-          const missing = !expired && !unauthorized && isMissingRelationError(leadsError);
-          const msg = expired
-            ? `Leads request is still pending after 3 s. The most likely causes are a missing public.leads table, an RLS recursion on profiles, or an unreachable Supabase instance. Check the console for the full breadcrumb trail.`
-            : leadsError instanceof Error ? leadsError.message : String(leadsError);
+          const e = (leadsError ?? {}) as {
+            message?: string; details?: string; hint?: string; code?: string;
+            name?: string; stack?: string;
+          };
+          const errMessage = expired
+            ? `Request timed out after ${LEADS_QUERY_TIMEOUT_MS} ms.`
+            : e.message ?? (leadsError instanceof Error ? leadsError.message : String(leadsError));
+          const errDetails = expired
+            ? 'The Supabase call to public.leads did not respond within the hard 5 s fuse. This almost always means the table is missing, an RLS policy is recursing on profiles, or the project is unreachable.'
+            : e.details ?? '(no details returned by Supabase)';
+          const errHint = expired ? '(no hint — client-side timeout)' : e.hint ?? '(no hint returned by Supabase)';
+          const errCode = expired ? 'CLIENT_TIMEOUT' : e.code ?? '(no code)';
+          console.error('[Leads] 🔴 rendering error box', { errMessage, errDetails, errHint, errCode, raw: leadsError });
+
           return (
-            <Card className={unauthorized ? 'border-amber-500/50' : 'border-destructive/40'}>
-              <CardContent className="py-10 px-6 text-center space-y-3">
-                <div className={cn(
-                  'mx-auto w-12 h-12 rounded-xl flex items-center justify-center',
-                  unauthorized ? 'bg-amber-500/10' : 'bg-destructive/10',
-                )}>
-                  {unauthorized
-                    ? <ShieldOff className="w-6 h-6 text-amber-600" />
-                    : missing
-                    ? <Database className="w-6 h-6 text-destructive" />
-                    : <AlertTriangle className="w-6 h-6 text-destructive" />}
-                </div>
-                <div className="space-y-1">
-                  <h3 className="font-semibold">
-                    {expired
-                      ? 'Still loading…'
-                      : unauthorized
-                      ? 'Unauthorized'
-                      : missing
-                      ? 'Leads table not found'
-                      : 'Couldn\'t load leads'}
-                  </h3>
-                  <p className="text-sm text-muted-foreground max-w-lg mx-auto">
-                    {expired
-                      ? 'The fetch has been pending for more than 3 seconds. We stopped waiting so you\'re not trapped on a spinner. Retry, or check the console for the full trail.'
-                      : unauthorized
-                      ? `Your account (${user?.email ?? 'signed-in user'}) doesn\'t have permission to read the leads table. This is usually an RLS policy mismatch or a role that hasn\'t been approved yet. Contact an admin if you believe this is a mistake.`
-                      : missing
-                      ? 'The public.leads table doesn\'t exist in this Supabase project yet. Run the setup SQL (in the project docs) in the Supabase SQL Editor — then hit Retry.'
-                      : 'Supabase returned an error or the request timed out. The full message is below, and in the browser console.'}
+            <div
+              role="alert"
+              className="border-4 border-red-600 bg-red-50 dark:bg-red-950/30 rounded-lg p-6 space-y-4 shadow-lg"
+            >
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-8 h-8 text-red-600 shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <h2 className="text-xl font-bold text-red-700 dark:text-red-400">
+                    Leads query failed
+                  </h2>
+                  <p className="text-sm text-red-700/80 dark:text-red-300/80">
+                    Supabase rejected the read or the request timed out. The exact
+                    error is printed below — use it to fix the database schema / RLS.
                   </p>
                 </div>
-                <pre className="text-[11px] bg-muted/40 rounded p-2 max-w-xl mx-auto text-left overflow-auto">
-                  {msg}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="border-red-300 text-red-700 hover:bg-red-100 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-900/40"
+                  onClick={() => { setLoadingExpired(false); refetch(); }}
+                >
+                  <RefreshCw className="w-3.5 h-3.5 mr-1" /> Retry
+                </Button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-[auto,1fr] gap-x-4 gap-y-2 text-sm font-mono">
+                <span className="font-semibold text-red-800 dark:text-red-300">code</span>
+                <code className="bg-red-100 dark:bg-red-900/40 rounded px-2 py-0.5 break-all">{errCode}</code>
+
+                <span className="font-semibold text-red-800 dark:text-red-300">message</span>
+                <pre className="bg-red-100 dark:bg-red-900/40 rounded px-2 py-1 whitespace-pre-wrap break-words">{errMessage}</pre>
+
+                <span className="font-semibold text-red-800 dark:text-red-300">details</span>
+                <pre className="bg-red-100 dark:bg-red-900/40 rounded px-2 py-1 whitespace-pre-wrap break-words">{errDetails}</pre>
+
+                <span className="font-semibold text-red-800 dark:text-red-300">hint</span>
+                <pre className="bg-red-100 dark:bg-red-900/40 rounded px-2 py-1 whitespace-pre-wrap break-words">{errHint}</pre>
+
+                <span className="font-semibold text-red-800 dark:text-red-300">raw</span>
+                <pre className="bg-red-100 dark:bg-red-900/40 rounded px-2 py-1 text-[11px] whitespace-pre-wrap break-words max-h-48 overflow-auto">
+                  {(() => {
+                    try { return JSON.stringify(leadsError, Object.getOwnPropertyNames(e), 2); }
+                    catch { return String(leadsError); }
+                  })()}
                 </pre>
-                <div className="flex items-center justify-center gap-2">
-                  <Button size="sm" variant="outline" onClick={() => { setLoadingExpired(false); refetch(); }}>
-                    <RefreshCw className="w-3.5 h-3.5 mr-1" /> Retry
-                  </Button>
-                </div>
-              </CardContent>
-            </Card>
+              </div>
+
+              <p className="text-[11px] text-red-700/70 dark:text-red-300/70">
+                {isUnauthorizedError(leadsError) && <><ShieldOff className="inline w-3 h-3 mr-1" />This looks like an RLS / permission denial. </>}
+                {isMissingRelationError(leadsError) && <><Database className="inline w-3 h-3 mr-1" />The <code>public.leads</code> table does not exist. </>}
+                The same payload has been logged to the browser console.
+              </p>
+            </div>
           );
         })()
       ) : isLoading ? (
