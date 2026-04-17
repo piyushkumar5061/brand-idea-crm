@@ -369,16 +369,45 @@ export default function Leads() {
     refetchLeads();
   };
 
+  /**
+   * Bulk-delete every lead currently in `selectedLeads`.
+   *
+   * Anti-hang contract:
+   *   1. Strict try / catch / finally — `setDeleting(false)` is an invariant,
+   *      guaranteed to fire even if Supabase throws or the request times out.
+   *   2. 8 s timeout fuse via withTimeout() so a hung DELETE (missing table,
+   *      RLS recursion, network flap) never leaves the button spinning forever.
+   *   3. On success: clear the selection, toast, and refetch both the leads
+   *      list AND the KPI counts so the UI is consistent after the write.
+   *   4. Diagnostic console breadcrumbs so a future hang leaves a trail.
+   */
   const deleteSelected = async () => {
     if (selectedLeads.size === 0) return;
-    setDeleting(true);
     const ids = Array.from(selectedLeads);
-    const { error } = await supabase.from('leads').delete().in('id', ids);
-    if (error) { toast.error(error.message); setDeleting(false); return; }
-    toast.success(`${ids.length} leads deleted`);
-    setSelectedLeads(new Set());
-    setDeleting(false);
-    refetchLeads();
+    console.log('[Leads:bulkDelete] 🗑  starting —', ids.length, 'id(s):', ids);
+    setDeleting(true);
+    try {
+      const { error } = await withTimeout(
+        supabase.from('leads').delete().in('id', ids),
+        8000,
+        'bulkDelete',
+      );
+      if (error) {
+        console.error('[Leads:bulkDelete] ❌ supabase error:', error);
+        throw error;
+      }
+      console.log('[Leads:bulkDelete] ✅ deleted', ids.length, 'lead(s)');
+      toast.success(`${ids.length} lead${ids.length === 1 ? '' : 's'} deleted`);
+      setSelectedLeads(new Set());
+      refetchLeads();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error('[Leads:bulkDelete] 💥 threw:', e);
+      toast.error(msg || 'Failed to delete leads');
+    } finally {
+      // INVARIANT: the button is re-enabled no matter what happened above.
+      setDeleting(false);
+    }
   };
 
   const bulkWhatsApp = () => {
@@ -825,6 +854,26 @@ export default function Leads() {
           </Button>
         )}
 
+        {/* Prominent bulk-delete — only rendered when rows are selected.
+            Sits inline with the filter bar so it's always visible at the top
+            of the page while making a selection. Uses the same hardened
+            confirmAndBulkDelete → deleteSelected path as the toolbars below. */}
+        {isAdminOrAbove && selectedLeads.size > 0 && (
+          <Button
+            size="sm"
+            variant="destructive"
+            className="h-8 text-xs"
+            onClick={confirmAndBulkDelete}
+            disabled={deleting}
+            title="Delete every lead you've selected"
+          >
+            <Trash2 className="w-3.5 h-3.5 mr-1" />
+            {deleting
+              ? 'Deleting…'
+              : `Delete ${selectedLeads.size} Lead${selectedLeads.size === 1 ? '' : 's'}`}
+          </Button>
+        )}
+
         <span className="text-xs text-muted-foreground ml-auto">
           {totalCount} total • {pageSize === 'all' ? 'Showing all' : `Page ${page + 1}/${totalPages}`}
         </span>
@@ -873,7 +922,9 @@ export default function Leads() {
                 disabled={deleting}
               >
                 <Trash2 className="w-3 h-3 mr-1" />
-                {deleting ? 'Deleting…' : `Delete ${selectedLeads.size}`}
+                {deleting
+                  ? 'Deleting…'
+                  : `Delete ${selectedLeads.size} Lead${selectedLeads.size === 1 ? '' : 's'}`}
               </Button>
             </>
           )}
@@ -902,7 +953,10 @@ export default function Leads() {
               <MessageCircle className="w-3.5 h-3.5 mr-1" /> Bulk WhatsApp
             </Button>
             <Button size="sm" variant="destructive" onClick={confirmAndBulkDelete} disabled={deleting}>
-              <Trash2 className="w-3.5 h-3.5 mr-1" /> {deleting ? 'Deleting...' : 'Delete'}
+              <Trash2 className="w-3.5 h-3.5 mr-1" />
+              {deleting
+                ? 'Deleting...'
+                : `Delete ${selectedLeads.size} Lead${selectedLeads.size === 1 ? '' : 's'}`}
             </Button>
             <Button size="sm" variant="ghost" className="sm:ml-auto" onClick={deselectAll}>
               <X className="w-3.5 h-3.5 mr-1" /> Deselect all
