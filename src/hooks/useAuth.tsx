@@ -1,15 +1,23 @@
-import { createContext, useContext, useEffect, useState, useCallback, useRef, ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, ReactNode } from 'react';
 import { User, Session } from '@supabase/supabase-js';
 import { supabase } from '@/integrations/supabase/client';
-import { toast } from 'sonner';
 
 export type AppRole = 'super_admin' | 'admin' | 'manager' | 'employee';
 export type ProfileStatus = 'pending' | 'approved' | 'suspended';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Founder god-mode constant.
+// This email is ALWAYS treated as a super_admin in the client, regardless of
+// what the profiles table says (or doesn't say). It's a hardcoded absolute
+// override, intentionally declared at module scope so every branch of the
+// auth flow — hydrate, onAuthStateChange, derived flags — reads the same
+// value and cannot disagree.
+// ─────────────────────────────────────────────────────────────────────────────
+export const FOUNDER_EMAIL = 'piyushkumar5061@gmail.com';
+
 interface ProfileData {
   role: AppRole | null;
   status: ProfileStatus | null;
-  /** true once the DB round-trip has completed (even if the row is missing / timed out) */
   fetched: boolean;
 }
 
@@ -17,24 +25,16 @@ interface AuthContextType {
   user: User | null;
   session: Session | null;
   role: AppRole | null;
-  /**
-   * Account gate status fetched directly from public.profiles:
-   *   'approved'  → user may enter the CRM
-   *   'pending'   → awaiting admin approval
-   *   'suspended' → account blocked
-   *   null        → no row found OR fetch timed out / failed
-   */
   profileStatus: ProfileStatus | null;
   /**
-   * Becomes true once the profiles SELECT has resolved — even if the row was
-   * missing, or the query errored, or we hit the hard 3 s safety cap.
-   *
-   * INVARIANT: profileFetched === true is ALWAYS accompanied by loading === false.
-   * Guards should only need to branch on `loading`. We expose this flag so
-   * diagnostics can tell whether we got a real answer vs. a timeout fallback.
+   * True once the hydration handshake (getSession + profile fetch, OR the
+   * god-mode short-circuit) has completed. Loading is only ever flipped to
+   * false inside the single atomic `applyAuthState` call — so any component
+   * that reads `loading === false` is guaranteed to see consistent values
+   * for user, session, role, and profileStatus at the same time.
    */
-  profileFetched: boolean;
   loading: boolean;
+  profileFetched: boolean;
   isAdminOrAbove: boolean;
   signOut: () => Promise<void>;
 }
@@ -44,289 +44,253 @@ const AuthContext = createContext<AuthContextType>({
   session: null,
   role: null,
   profileStatus: null,
-  profileFetched: false,
   loading: true,
+  profileFetched: false,
   isAdminOrAbove: false,
   signOut: async () => {},
 });
 
 export const useAuth = () => useContext(AuthContext);
 
-// ---------------------------------------------------------------------------
-// Timing constants — chosen so the inner timeouts ALWAYS fire before the
-// outer safety cap, giving the nice "real data or null, never wedged" guarantee.
-// ---------------------------------------------------------------------------
-const PROFILE_FETCH_TIMEOUT_MS = 2000;  // per profiles SELECT
-const HARD_LOADING_CAP_MS      = 3000;  // outermost "you are unblocked NOW" fuse
-const FOUNDER_EMAIL = 'piyushkumar5061@gmail.com';
+// ─────────────────────────────────────────────────────────────────────────────
+// Timing budgets. Chosen so the worst-case hydration is ~5 s end-to-end —
+// long enough to cover a slow network, short enough that the user isn't stuck
+// behind a spinner if Supabase is unreachable.
+// ─────────────────────────────────────────────────────────────────────────────
+const GET_SESSION_TIMEOUT_MS = 3000;
+const PROFILE_FETCH_TIMEOUT_MS = 2500;
 
 /**
- * Founder escape hatch. If the profile fetch returns null/timeout for the
- * founder email, we synthesise a super_admin/approved profile in-memory so
- * the UI never degrades to "Member"/"Team" + employee sidebar for the
- * account that has to be able to fix the DB in the first place.
- *
- * This is additive — the DB row is still the source of truth for everyone
- * else, and if the founder's real row says anything other than null, we
- * respect it (including a suspended override).
+ * Race a promise against a hard timer. Always resolves/rejects within `ms`;
+ * never hangs. Required because Supabase's JS client has been observed to
+ * wedge on both getSession() and .select() calls against unreachable DBs.
  */
-function applyFounderFallback(profile: ProfileData, email: string | undefined): ProfileData {
-  if (email !== FOUNDER_EMAIL) return profile;
-  if (profile.role !== null && profile.status !== null) return profile;
-  console.warn(
-    '[useAuth] 🔑 FOUNDER FALLBACK ENGAGED — profiles row was null/timeout for',
-    email, '— synthesising { role: super_admin, status: approved } locally.',
-    'Previous profile:', profile,
-  );
-  return {
-    role:    profile.role    ?? 'super_admin',
-    status:  profile.status  ?? 'approved',
-    fetched: true,
-  };
+function withTimeout<T>(p: PromiseLike<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`[useAuth:${label}] timed out after ${ms}ms`)),
+      ms,
+    );
+    Promise.resolve(p).then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); },
+    );
+  });
 }
 
-/** Fetcher can only resolve (never reject) — caller never needs try/catch. */
+/**
+ * Fetch the authenticated user's profile row. Can never reject — any failure
+ * (RLS block, missing table, timeout, exception) resolves to `{role:null,
+ * status:null, fetched:true}` so the caller always gets a terminal answer.
+ *
+ * IMPORTANT: this is skipped entirely for the founder email. See hydrate().
+ */
 async function fetchProfileSafe(userId: string): Promise<ProfileData> {
-  console.log('[useAuth] 🔍 fetchProfileSafe START — userId:', userId);
-  const timeoutPromise = new Promise<ProfileData>((resolve) =>
-    setTimeout(() => {
-      console.warn(
-        `[useAuth] ⏱ profile fetch timed out after ${PROFILE_FETCH_TIMEOUT_MS}ms ` +
-        '— proceeding with null role (session remains valid)'
-      );
-      resolve({ role: null, status: null, fetched: true });
-    }, PROFILE_FETCH_TIMEOUT_MS),
-  );
-
-  const queryPromise: Promise<ProfileData> = (async () => {
-    try {
-      console.log('[useAuth] → supabase.from(profiles).select for user', userId);
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('role, status')
-        .eq('user_id', userId)
-        .maybeSingle();
-      console.log('[useAuth] ← supabase profiles result:', { data, error });
-
-      if (error) {
-        console.error(
-          '[useAuth] ❌ profiles SELECT error — table may not exist or RLS is blocking it.\n' +
-          'Run brand_idea_init.sql in Supabase SQL Editor. Raw error:', error,
-        );
-        return { role: null, status: null, fetched: true };
-      }
-
-      if (!data) {
-        console.warn(
-          '[useAuth] ⚠️  No profiles row found for user', userId,
-          '— INSERT a row via the emergency SQL or re-run brand_idea_init.sql',
-        );
-        return { role: null, status: null, fetched: true };
-      }
-
-      const r = (data.role   as AppRole       | undefined) ?? null;
-      const s = (data.status as ProfileStatus | undefined) ?? null;
-      console.info('[useAuth] ✅ profile loaded →', { role: r, status: s, userId });
-      return { role: r, status: s, fetched: true };
-    } catch (e) {
-      console.error('[useAuth] 💥 fetchProfile threw unexpectedly:', e);
+  console.log('[useAuth] 🔍 fetchProfileSafe start — userId:', userId);
+  try {
+    const { data, error } = await withTimeout(
+      supabase.from('profiles').select('role, status').eq('user_id', userId).maybeSingle(),
+      PROFILE_FETCH_TIMEOUT_MS,
+      'profiles',
+    );
+    if (error) {
+      console.error('[useAuth] ❌ profiles SELECT error:', error);
       return { role: null, status: null, fetched: true };
     }
-  })();
-
-  return Promise.race([queryPromise, timeoutPromise]);
+    if (!data) {
+      console.warn('[useAuth] ⚠️ no profiles row for', userId);
+      return { role: null, status: null, fetched: true };
+    }
+    const r = (data.role   as AppRole       | undefined) ?? null;
+    const s = (data.status as ProfileStatus | undefined) ?? null;
+    console.info('[useAuth] ✅ profile loaded →', { role: r, status: s });
+    return { role: r, status: s, fetched: true };
+  } catch (e) {
+    console.error('[useAuth] 💥 fetchProfileSafe threw:', e);
+    return { role: null, status: null, fetched: true };
+  }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Provider
+// ─────────────────────────────────────────────────────────────────────────────
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser]                   = useState<User | null>(null);
-  const [session, setSession]             = useState<Session | null>(null);
-  const [role, setRole]                   = useState<AppRole | null>(null);
-  const [profileStatus, setProfileStatus] = useState<ProfileStatus | null>(null);
+  const [user, setUser]                     = useState<User | null>(null);
+  const [session, setSession]               = useState<Session | null>(null);
+  const [role, setRole]                     = useState<AppRole | null>(null);
+  const [profileStatus, setProfileStatus]   = useState<ProfileStatus | null>(null);
   const [profileFetched, setProfileFetched] = useState(false);
-  const [loading, setLoading]             = useState(true);
+  const [loading, setLoading]               = useState(true);
 
-  /** Prevents the 3 s fallback toast from firing if we already resolved cleanly. */
-  const hasSettledRef = useRef(false);
+  const mountedRef = useRef(true);
 
-  const fetchProfile = useCallback((userId: string) => fetchProfileSafe(userId), []);
+  /**
+   * The ONLY setter path. Applies session + profile atomically, with the
+   * founder god-mode override baked in. After this runs, every consumer of
+   * useAuth() sees a coherent snapshot — there is no intermediate render
+   * where user is set but role isn't.
+   *
+   * Founder god-mode: if the session's email is the founder, we FORCE
+   * role='super_admin' and status='approved', regardless of what the
+   * profiles table returned. The DB is advisory for this account; the
+   * client is the authority. This is the single line that permanently
+   * fixes the "downgraded to Team on refresh" bug.
+   */
+  const applyAuthState = useCallback((
+    newSession: Session | null,
+    profile: ProfileData,
+  ) => {
+    if (!mountedRef.current) return;
+    const email = newSession?.user?.email;
+    const isFounder = email === FOUNDER_EMAIL;
+
+    const effectiveRole: AppRole | null =
+      isFounder ? 'super_admin' : profile.role;
+    const effectiveStatus: ProfileStatus | null =
+      isFounder ? 'approved' : profile.status;
+
+    if (isFounder && (profile.role !== 'super_admin' || profile.status !== 'approved')) {
+      console.warn(
+        '[useAuth] 🔑 FOUNDER GOD-MODE — overriding DB profile',
+        { dbRole: profile.role, dbStatus: profile.status },
+        '→ { role: super_admin, status: approved }',
+      );
+    }
+
+    // Batch: all six setState calls flush in the same React tick because
+    // we're inside a synchronous function (React 18 auto-batches).
+    setSession(newSession);
+    setUser(newSession?.user ?? null);
+    setRole(effectiveRole);
+    setProfileStatus(effectiveStatus);
+    setProfileFetched(true);
+    setLoading(false);
+
+    console.log('[useAuth] 🏁 applyAuthState', {
+      user: email ?? null,
+      role: effectiveRole,
+      status: effectiveStatus,
+      isFounder,
+    });
+  }, []);
 
   useEffect(() => {
-    let mounted = true;
+    mountedRef.current = true;
 
-    /**
-     * Atomically flip us out of the loading state.
-     * INVARIANT: once this runs, the spinner WILL die.
-     */
-    const settle = (p: ProfileData) => {
-      if (!mounted) return;
-      hasSettledRef.current = true;
-      setRole(p.role);
-      setProfileStatus(p.status);
-      setProfileFetched(true);     // always true — the fetch round-trip is done
-      setLoading(false);            // always false — spinner dies
-    };
-
-    /**
-     * Same as settle() but for the "no session at all" case. Role/status stay null.
-     */
-    const settleNoSession = () => {
-      if (!mounted) return;
-      hasSettledRef.current = true;
-      setRole(null);
-      setProfileStatus(null);
-      setProfileFetched(true);
-      setLoading(false);
-    };
-
-    // ── (1) Hydrate on page load from persisted session ────────────────────
-    // This is the critical path for the refresh bug. We MUST exit loading,
-    // regardless of whether getSession() resolves, rejects, or hangs.
+    // ── Hydration (on page load / refresh) ──────────────────────────────
     const hydrate = async () => {
-      console.log('[useAuth] 🚀 Auth Hydration Started');
+      console.log('[useAuth] 🚀 hydrate start');
+
+      // Step 1: who are we?
+      let sess: Session | null = null;
       try {
-        console.log('[useAuth] → supabase.auth.getSession()');
-        const { data, error } = await supabase.auth.getSession();
-        console.log('[useAuth] ← getSession result:', { hasSession: !!data?.session, email: data?.session?.user?.email, error });
-        if (!mounted) { console.log('[useAuth] hydrate: component unmounted mid-flight'); return; }
-
-        if (error) {
-          console.error('[useAuth] ❌ getSession() returned an error:', error);
-          settleNoSession();
-          return;
-        }
-
-        const existing = data.session;
-        setSession(existing);
-        setUser(existing?.user ?? null);
-
-        if (!existing?.user) {
-          console.log('[useAuth] hydrate: no session → settling as logged-out');
-          settleNoSession();
-          return;
-        }
-
-        // Session exists → fetch profile (itself bounded by 2 s).
-        const profile = await fetchProfile(existing.user.id);
-        console.log('[useAuth] 📦 Profile Fetch Result:', profile);
-        if (!mounted) return;
-        const effective = applyFounderFallback(profile, existing.user.email);
-        console.log('[useAuth] 🏁 settling with effective profile:', effective);
-        settle(effective);
+        const { data, error } = await withTimeout(
+          supabase.auth.getSession(),
+          GET_SESSION_TIMEOUT_MS,
+          'getSession',
+        );
+        if (error) throw error;
+        sess = data?.session ?? null;
+        console.log('[useAuth] ← getSession', { hasSession: !!sess, email: sess?.user?.email });
       } catch (e) {
-        // getSession() itself threw (rare, but possible on corrupted localStorage).
-        console.error('[useAuth] 💥 hydrate() threw:', e);
-        if (mounted) settleNoSession();
-      } finally {
-        // Belt-and-suspenders: even if every branch above were to forget to
-        // settle, this guarantees loading dies. No infinite spinner — ever.
-        if (mounted && !hasSettledRef.current) {
-          console.warn('[useAuth] 🛟 hydrate finally: force-settling (no branch settled)');
-          settleNoSession();
-        }
-        console.log('[useAuth] ✓ Hydration complete, hasSettled=', hasSettledRef.current);
+        console.error('[useAuth] ❌ getSession failed — treating as logged-out:', e);
+        sess = null;
       }
+
+      if (!mountedRef.current) return;
+
+      // Step 2a: no session → settle as logged-out.
+      if (!sess?.user) {
+        applyAuthState(null, { role: null, status: null, fetched: true });
+        return;
+      }
+
+      // Step 2b: FOUNDER GOD-MODE SHORT-CIRCUIT.
+      // We don't even hit the profiles table. The founder is ALWAYS
+      // super_admin in the client. Settle immediately — hydration done
+      // in one tick, no race window where role could be null.
+      if (sess.user.email === FOUNDER_EMAIL) {
+        console.log('[useAuth] 🔑 founder detected at hydrate — god-mode short-circuit');
+        applyAuthState(sess, { role: 'super_admin', status: 'approved', fetched: true });
+        return;
+      }
+
+      // Step 2c: everyone else → fetch profile, then settle.
+      const profile = await fetchProfileSafe(sess.user.id);
+      if (!mountedRef.current) return;
+      applyAuthState(sess, profile);
     };
 
-    // ── (2) Subscribe to future auth events ────────────────────────────────
-    // Supabase fires INITIAL_SESSION once immediately — we intentionally
-    // IGNORE that one (hydrate() above is the source of truth for the
-    // initial state). We only react to post-initial transitions:
-    // SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, USER_UPDATED.
+    // ── Auth events (sign-in, sign-out, token refresh) ──────────────────
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (event, newSession) => {
-        if (!mounted) return;
-        console.debug('[useAuth] auth event:', event, newSession?.user?.email);
+        if (!mountedRef.current) return;
+        console.log('[useAuth] 🔔 auth event', event, newSession?.user?.email);
 
-        if (event === 'INITIAL_SESSION') return; // handled by hydrate()
+        // The INITIAL_SESSION event fires once immediately; hydrate() is
+        // already handling it. Ignoring it here prevents a double-settle race.
+        if (event === 'INITIAL_SESSION') return;
 
-        setSession(newSession);
-        setUser(newSession?.user ?? null);
-
+        // Sign-out or session ended → clear and settle.
         if (!newSession?.user) {
-          // SIGNED_OUT or session ended
-          settleNoSession();
+          applyAuthState(null, { role: null, status: null, fetched: true });
           return;
         }
 
-        // SIGNED_IN / TOKEN_REFRESHED / USER_UPDATED — refresh the profile.
-        // Deferred with setTimeout(0) to avoid deadlocks with Supabase's
-        // internal auth lock (documented gotcha).
+        // Founder sign-in / token refresh → god-mode, no profile fetch.
+        if (newSession.user.email === FOUNDER_EMAIL) {
+          applyAuthState(newSession, { role: 'super_admin', status: 'approved', fetched: true });
+          return;
+        }
+
+        // Non-founder: defer the profile fetch to the next microtask to
+        // avoid deadlocking Supabase's auth lock (documented gotcha).
+        // While we're fetching, we flip loading=true to keep the UI honest —
+        // protected routes will show the central loader until the new role
+        // is confirmed. NO intermediate "signed in but role unknown" render.
+        setLoading(true);
         setTimeout(async () => {
-          try {
-            console.log('[useAuth] auth-event → fetchProfile for', newSession.user.email);
-            const profile = await fetchProfile(newSession.user.id);
-            console.log('[useAuth] auth-event Profile Fetch Result:', profile);
-            if (!mounted) return;
-            const effective = applyFounderFallback(profile, newSession.user.email);
-            console.log('[useAuth] auth-event settling with:', effective);
-            settle(effective);
-          } catch (e) {
-            console.error('[useAuth] 💥 onAuthStateChange profile fetch threw:', e);
-            if (mounted) settleNoSession();
-          } finally {
-            // Guarantee: spinner dies after any SIGNED_IN event, even if
-            // the profile fetch path somehow failed to settle above.
-            // Unconditional set is safe — React dedupes identical values.
-            if (mounted) {
-              setLoading(false);
-              setProfileFetched(true);
-            }
-          }
+          const profile = await fetchProfileSafe(newSession.user.id);
+          if (!mountedRef.current) return;
+          applyAuthState(newSession, profile);
         }, 0);
       },
     );
 
-    // ── (3) Hard 3 s loading cap ───────────────────────────────────────────
-    // Last line of defense: if we are STILL loading after 3 s (getSession
-    // hung, profile fetch hung past its own 2 s fuse, browser threw, etc.)
-    // we force-exit loading and surface a toast so the user knows to refresh
-    // or check the console. Never traps the UI.
-    const hardCap = setTimeout(() => {
-      if (!mounted) return;
-      if (hasSettledRef.current) return;
-      console.error(
-        `[useAuth] HARD CAP: still loading after ${HARD_LOADING_CAP_MS}ms — ` +
-        'forcing loading=false. Likely causes: profiles table missing, RLS ' +
-        'recursion, or unreachable Supabase. Check the network tab and run ' +
-        'brand_idea_init.sql if the profiles table is absent.',
-      );
-      toast.error(
-        "Auth took too long to load. If you see this often, check the console — " +
-        "there's likely a profiles table / RLS issue.",
-        { duration: 6000 },
-      );
-      settleNoSession();
-    }, HARD_LOADING_CAP_MS);
-
-    // Kick off hydration.
     hydrate();
 
     return () => {
-      mounted = false;
+      mountedRef.current = false;
       subscription.unsubscribe();
-      clearTimeout(hardCap);
     };
-    // fetchProfile is useCallback-stable; re-running this effect would
-    // duplicate the subscription, so we intentionally use an empty dep array.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const signOut = useCallback(async () => {
     try { await supabase.auth.signOut(); }
-    catch (e) { console.error('[useAuth] sign out error:', e); }
-    setUser(null);
-    setSession(null);
-    setRole(null);
-    setProfileStatus(null);
-    setProfileFetched(false);
+    catch (e) { console.error('[useAuth] signOut threw:', e); }
+    // Force-clear local state so the router redirects to /login immediately.
+    if (mountedRef.current) {
+      setSession(null);
+      setUser(null);
+      setRole(null);
+      setProfileStatus(null);
+    }
     window.location.href = '/login';
   }, []);
 
-  const isAdminOrAbove = role === 'super_admin' || role === 'admin' || role === 'manager';
+  // Derived: isAdminOrAbove honours BOTH the role column AND the founder
+  // email. Either condition alone is enough. If a UI element is gated on
+  // this, the founder always passes.
+  const isAdminOrAbove =
+    role === 'super_admin' ||
+    role === 'admin' ||
+    role === 'manager' ||
+    user?.email === FOUNDER_EMAIL;
 
   return (
     <AuthContext.Provider
-      value={{ user, session, role, profileStatus, profileFetched, loading, isAdminOrAbove, signOut }}
+      value={{ user, session, role, profileStatus, loading, profileFetched, isAdminOrAbove, signOut }}
     >
       {children}
     </AuthContext.Provider>

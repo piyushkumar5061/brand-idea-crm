@@ -24,7 +24,7 @@ import {
   Phone, Search, Filter, X, Trash2, ChevronLeft, ChevronRight,
   MessageCircle, Users, SlidersHorizontal, CalendarIcon, AlertTriangle,
   LayoutList, KanbanSquare, Filter as FunnelIcon, Trophy, Flame,
-  CircleDot, Database, RefreshCw,
+  CircleDot, Database, RefreshCw, ShieldOff,
 } from 'lucide-react';
 
 /**
@@ -57,6 +57,27 @@ function isMissingRelationError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   const code = (err as { code?: string }).code ?? '';
   return code === '42P01' || /relation .* does not exist/i.test(msg);
+}
+
+/**
+ * Heuristic: does this Supabase error mean "you are not allowed to read this"?
+ * Covers:
+ *   - PostgREST 401 / 403 responses
+ *   - Postgres 42501 (insufficient_privilege)
+ *   - RLS policy denials — message contains "permission denied" or "row-level security"
+ *   - JWT / auth failures — message contains "JWT" or "not authenticated"
+ * We surface a distinct "Unauthorized" card (instead of a generic error) so a
+ * role mismatch is NEVER silent — per the scorched-earth auth contract.
+ */
+function isUnauthorizedError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  const anyErr = err as { code?: string; status?: number; statusCode?: number };
+  const code   = anyErr.code ?? '';
+  const status = anyErr.status ?? anyErr.statusCode ?? 0;
+  if (status === 401 || status === 403) return true;
+  if (code === '42501' || code === 'PGRST301' || code === 'PGRST302') return true;
+  return /permission denied|row-level security|not authenticated|JWT|unauthorized/i.test(msg);
 }
 
 interface Lead {
@@ -185,10 +206,18 @@ export default function Leads() {
 
   const { data: leadsData, isLoading, isError, error: leadsError, refetch } = useQuery({
     queryKey: leadsQueryKey,
+    // Never fire until auth has fully hydrated — prevents the "role mismatch
+    // empty result" silent-failure mode where a logged-in user would briefly
+    // appear unauthorized because useAuth hadn't resolved yet.
+    enabled: !!user,
     placeholderData: keepPreviousData,
     // React Query's defaults would retry a hung request 3 times — that turns a
-    // 7 s timeout into a ~30 s spinner trap. One retry is plenty.
-    retry: 1,
+    // 7 s timeout into a ~30 s spinner trap. One retry is plenty. Also: never
+    // retry an auth failure — it's not going to resolve by trying again.
+    retry: (failureCount, err) => {
+      if (isUnauthorizedError(err)) return false;
+      return failureCount < 1;
+    },
     retryDelay: 500,
     queryFn: async () => {
       console.log('[Leads] 📥 Fetching leads — key:', leadsQueryKey[1]);
@@ -976,23 +1005,39 @@ export default function Leads() {
       {(isError || (isLoading && loadingExpired)) ? (
         (() => {
           const expired = isLoading && loadingExpired && !isError;
-          const missing = !expired && isMissingRelationError(leadsError);
+          const unauthorized = !expired && isUnauthorizedError(leadsError);
+          const missing = !expired && !unauthorized && isMissingRelationError(leadsError);
           const msg = expired
             ? `Leads request is still pending after 3 s. The most likely causes are a missing public.leads table, an RLS recursion on profiles, or an unreachable Supabase instance. Check the console for the full breadcrumb trail.`
             : leadsError instanceof Error ? leadsError.message : String(leadsError);
           return (
-            <Card className="border-destructive/40">
+            <Card className={unauthorized ? 'border-amber-500/50' : 'border-destructive/40'}>
               <CardContent className="py-10 px-6 text-center space-y-3">
-                <div className="mx-auto w-12 h-12 rounded-xl bg-destructive/10 flex items-center justify-center">
-                  {missing ? <Database className="w-6 h-6 text-destructive" /> : <AlertTriangle className="w-6 h-6 text-destructive" />}
+                <div className={cn(
+                  'mx-auto w-12 h-12 rounded-xl flex items-center justify-center',
+                  unauthorized ? 'bg-amber-500/10' : 'bg-destructive/10',
+                )}>
+                  {unauthorized
+                    ? <ShieldOff className="w-6 h-6 text-amber-600" />
+                    : missing
+                    ? <Database className="w-6 h-6 text-destructive" />
+                    : <AlertTriangle className="w-6 h-6 text-destructive" />}
                 </div>
                 <div className="space-y-1">
                   <h3 className="font-semibold">
-                    {expired ? 'Still loading…' : missing ? 'Leads table not found' : 'Couldn\'t load leads'}
+                    {expired
+                      ? 'Still loading…'
+                      : unauthorized
+                      ? 'Unauthorized'
+                      : missing
+                      ? 'Leads table not found'
+                      : 'Couldn\'t load leads'}
                   </h3>
                   <p className="text-sm text-muted-foreground max-w-lg mx-auto">
                     {expired
                       ? 'The fetch has been pending for more than 3 seconds. We stopped waiting so you\'re not trapped on a spinner. Retry, or check the console for the full trail.'
+                      : unauthorized
+                      ? `Your account (${user?.email ?? 'signed-in user'}) doesn\'t have permission to read the leads table. This is usually an RLS policy mismatch or a role that hasn\'t been approved yet. Contact an admin if you believe this is a mistake.`
                       : missing
                       ? 'The public.leads table doesn\'t exist in this Supabase project yet. Run the setup SQL (in the project docs) in the Supabase SQL Editor — then hit Retry.'
                       : 'Supabase returned an error or the request timed out. The full message is below, and in the browser console.'}

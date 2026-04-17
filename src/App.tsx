@@ -1,10 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Route, Routes, Navigate } from "react-router-dom";
-import { useEffect, useState } from "react";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { AuthProvider, useAuth } from "@/hooks/useAuth";
+import { AuthProvider, useAuth, FOUNDER_EMAIL } from "@/hooks/useAuth";
 import AppLayout from "@/components/AppLayout";
 import LandingPage from "@/pages/LandingPage";
 import PendingApproval from "@/pages/PendingApproval";
@@ -19,52 +18,35 @@ import Reports from "@/pages/Reports";
 import Attendance from "@/pages/Attendance";
 import Settings from "@/pages/Settings";
 import ComingSoon from "@/pages/ComingSoon";
-import { Megaphone, MailCheck, Briefcase, Target, MapPin, FileText, Shield } from "lucide-react";
+import { Megaphone, MailCheck, Briefcase, Target, MapPin, FileText, Shield, Sparkles } from "lucide-react";
 
 const queryClient = new QueryClient();
 
 // ---------------------------------------------------------------------------
-// Helpers
+// FullScreenLoader
 // ---------------------------------------------------------------------------
-
-function LoadingScreen() {
+// The ONLY loading UI shown before auth hydration completes. Every protected
+// route funnels through here. No "hard cap" escape hatch — useAuth is
+// architecturally bounded (getSession 3 s + profile 2.5 s = ~5 s worst case,
+// and founder god-mode resolves in 1 tick), so a stuck spinner is no longer
+// a possibility we need to defend against in the router.
+// ---------------------------------------------------------------------------
+function FullScreenLoader() {
   return (
-    <div className="min-h-screen flex items-center justify-center text-muted-foreground">
-      Loading…
+    <div className="min-h-screen flex flex-col items-center justify-center gap-4 bg-background text-muted-foreground">
+      <Sparkles className="h-8 w-8 animate-pulse text-primary" aria-hidden />
+      <p className="text-sm tracking-wide">Loading your workspace…</p>
     </div>
   );
 }
 
 /**
- * Component-local escape hatch — if useAuth is STILL reporting loading=true
- * after 3 seconds (shouldn't happen, but defense in depth), we stop rendering
- * the spinner and render children anyway. The auth gate below will still
- * refuse to hand out admin access, so this is safe.
- */
-function useHardLoadingCap(active: boolean, ms = 3000): boolean {
-  const [capped, setCapped] = useState(false);
-  useEffect(() => {
-    if (!active) { setCapped(false); return; }
-    const t = setTimeout(() => {
-      console.warn(`[App] Hard loading cap hit at ${ms}ms — unblocking route render.`);
-      setCapped(true);
-    }, ms);
-    return () => clearTimeout(t);
-  }, [active, ms]);
-  return capped;
-}
-
-/**
- * Returns true if the user should bypass the approval gate.
- *
- * TWO independent checks are intentional — either one alone is enough:
- *  1. email match  — works even if the profiles row is missing / RLS-blocked
- *  2. role match   — works even if user.email is undefined (rare OAuth edge case)
- *
- * This ensures the super-admin can NEVER be permanently locked out by a DB issue.
+ * Auto-approved if the user is the founder (email match) OR holds the
+ * super_admin role. Either alone is sufficient — the founder can never be
+ * locked out by a missing/RLS-blocked profile row because the email check
+ * runs independently of the DB.
  */
 function isAutoApproved(userEmail: string | undefined, role: string | null): boolean {
-  const FOUNDER_EMAIL = 'piyushkumar5061@gmail.com';
   return userEmail === FOUNDER_EMAIL || role === 'super_admin';
 }
 
@@ -73,11 +55,7 @@ function isAutoApproved(userEmail: string | undefined, role: string | null): boo
 // ---------------------------------------------------------------------------
 function RootRoute() {
   const { user, loading } = useAuth();
-  const capped = useHardLoadingCap(loading);
-  // Still loading AND the hard cap hasn't fired → spinner.
-  // Once capped or loading is false → render. If we're capped without a user
-  // just show the landing page (same as logged-out).
-  if (loading && !capped) return <LoadingScreen />;
+  if (loading) return <FullScreenLoader />;
   if (user) return <Navigate to="/dashboard" replace />;
   return <LandingPage />;
 }
@@ -86,46 +64,42 @@ function RootRoute() {
 // ProtectedRoute — single source of truth for CRM access
 // ---------------------------------------------------------------------------
 /**
- * Access decision matrix:
+ * Access decision matrix — evaluated AFTER hydration is complete:
  *
  *  State                                    │ Result
  *  ─────────────────────────────────────────┼──────────────────────────────
- *  loading = true                           │ spinner (never block early)
+ *  loading = true                           │ FullScreenLoader (block)
  *  no session                               │ → /login
  *  status = 'suspended'                     │ Suspended screen
  *  status = 'approved'                      │ ✅ enter CRM
  *  role   = 'super_admin'  (auto-approved)  │ ✅ enter CRM (bypass)
  *  email  = founder email  (auto-approved)  │ ✅ enter CRM (bypass)
  *  status = 'pending' OR null               │ Awaiting Approval screen
- *    (null = DB timed-out or row missing)   │
  *
- * The suspended check runs BEFORE the auto-approved check so a suspended
- * super_admin still sees the right screen (admin would fix via SQL directly).
+ * Because useAuth's `applyAuthState` is atomic, when `loading === false`
+ * every field below (user / role / profileStatus) is guaranteed coherent —
+ * there is no intermediate render where user is set but role isn't.
  */
 function ProtectedRoute({ children, adminOnly = false }: {
   children: React.ReactNode;
   adminOnly?: boolean;
 }) {
   const { user, loading, profileStatus, role, isAdminOrAbove } = useAuth();
-  const capped = useHardLoadingCap(loading);
 
-  // ── 1. Still fetching — but bail after 3 s so we NEVER trap on a spinner.
-  //      The downstream checks still enforce auth correctly even if we fall
-  //      through with incomplete data (no user → /login, no status → pending).
-  if (loading && !capped) return <LoadingScreen />;
+  // 1. Block until hydration is 100 % complete. No escape hatch.
+  if (loading) return <FullScreenLoader />;
 
-  // ── 2. No session ────────────────────────────────────────────────────────
+  // 2. No session → login.
   if (!user) return <Navigate to="/login" replace />;
 
-  // ── 3. Suspended — shown even to super_admins (they must fix via SQL) ────
+  // 3. Suspended — shown even to super_admins (fixed via SQL).
   if (profileStatus === 'suspended') return <PendingApproval suspended />;
 
-  // ── 4. Gate: must be EXPLICITLY 'approved' ─ OR ─ auto-approved role/email
-  //      Founder bypass (piyushkumar5061@gmail.com) is handled by isAutoApproved.
+  // 4. Approved — DB says so, OR founder/super_admin bypass.
   const approved = profileStatus === 'approved' || isAutoApproved(user.email, role);
   if (!approved) return <PendingApproval />;
 
-  // ── 5. Admin-only routes ─────────────────────────────────────────────────
+  // 5. Admin-only gate.
   const hasAdminAccess = isAdminOrAbove || isAutoApproved(user.email, role);
   if (adminOnly && !hasAdminAccess) return <Navigate to="/dashboard" replace />;
 
@@ -137,8 +111,7 @@ function ProtectedRoute({ children, adminOnly = false }: {
 // ---------------------------------------------------------------------------
 function AuthRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
-  const capped = useHardLoadingCap(loading);
-  if (loading && !capped) return <LoadingScreen />;
+  if (loading) return <FullScreenLoader />;
   if (user) return <Navigate to="/dashboard" replace />;
   return <>{children}</>;
 }
