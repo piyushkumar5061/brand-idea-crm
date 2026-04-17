@@ -116,6 +116,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading]               = useState(true);
 
   const mountedRef = useRef(true);
+  // Track the last user id we fully resolved. Used to distinguish a real
+  // identity change (login / user switch) from a token-refresh event where
+  // the role hasn't changed and we don't need to flip loading=true.
+  const lastUserIdRef = useRef<string | null>(null);
 
   /**
    * The ONLY setter path. Writes the DB-returned role/status verbatim.
@@ -134,6 +138,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setProfileStatus(profile.status);
     setProfileFetched(profile.fetched);
     setLoading(false);
+    lastUserIdRef.current = newSession?.user?.id ?? null;
 
     console.log('[useAuth] 🏁 applyAuthState', {
       user: newSession?.user?.email ?? null,
@@ -195,12 +200,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        // Signed-in / token-refreshed → fetch the profile before updating.
-        // Flip loading=true so protected routes block on the central loader
-        // instead of briefly rendering with stale role data.
+        const incomingUid = newSession.user.id;
+        const sameUser = lastUserIdRef.current === incomingUid;
+
+        // TOKEN_REFRESHED / USER_UPDATED for the already-resolved user →
+        // update the session silently, refetch the profile in the background,
+        // DO NOT flip loading=true (that would flash the FullScreenLoader
+        // on every hour-ish when the access token rotates).
+        if (sameUser && event !== 'SIGNED_IN') {
+          console.log('[useAuth] ↻ background refresh — same user, no loader');
+          setSession(newSession);
+          setUser(newSession.user);
+          setTimeout(async () => {
+            const profile = await fetchProfile(incomingUid);
+            if (!mountedRef.current) return;
+            // Only update role/status if the fetch actually returned data;
+            // a transient RLS/timeout shouldn't wipe a known-good role.
+            if (profile.role !== null || profile.status !== null) {
+              setRole(profile.role);
+              setProfileStatus(profile.status);
+            }
+            setProfileFetched(true);
+            lastUserIdRef.current = incomingUid;
+          }, 0);
+          return;
+        }
+
+        // Identity change (fresh login OR user switch) → block with the
+        // loader, fetch the profile, then settle atomically.
         setLoading(true);
         setTimeout(async () => {
-          const profile = await fetchProfile(newSession.user.id);
+          const profile = await fetchProfile(incomingUid);
           if (!mountedRef.current) return;
           applyAuthState(newSession, profile);
         }, 0);
@@ -217,14 +247,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signOut = useCallback(async () => {
+    // Remote sign-out first — revokes the refresh token server-side.
     try { await supabase.auth.signOut(); }
-    catch (e) { console.error('[useAuth] signOut threw:', e); }
+    catch (e) { console.error('[useAuth] signOut (remote) threw:', e); }
+
+    // Belt-and-braces: wipe any residual Supabase auth keys from localStorage.
+    // If the remote call failed (network flap, expired token) the keys would
+    // otherwise remain and getSession() would revive the session on reload.
+    try {
+      const keys: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && (k.startsWith('sb-') || k.startsWith('supabase.'))) keys.push(k);
+      }
+      keys.forEach(k => localStorage.removeItem(k));
+      if (keys.length) console.log('[useAuth] 🧹 cleared', keys.length, 'local auth key(s)');
+    } catch (e) {
+      console.warn('[useAuth] localStorage cleanup threw:', e);
+    }
+
     if (mountedRef.current) {
       setSession(null);
       setUser(null);
       setRole(null);
       setProfileStatus(null);
+      lastUserIdRef.current = null;
     }
+    // Hard-navigate so every hook, query-client cache, and component tree
+    // is rebuilt from a clean slate. Avoids stale-data bleed-through bugs.
     window.location.href = '/login';
   }, []);
 

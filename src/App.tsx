@@ -27,9 +27,9 @@ const queryClient = new QueryClient();
 // ---------------------------------------------------------------------------
 // The ONLY loading UI shown before auth hydration completes. Every protected
 // route funnels through here. No "hard cap" escape hatch — useAuth is
-// architecturally bounded (getSession 3 s + profile 2.5 s = ~5 s worst case,
-// and founder god-mode resolves in 1 tick), so a stuck spinner is no longer
-// a possibility we need to defend against in the router.
+// architecturally bounded (getSession 5 s + profile 5 s = ~10 s worst case),
+// so a stuck spinner is no longer a possibility we need to defend against
+// in the router.
 // ---------------------------------------------------------------------------
 function FullScreenLoader() {
   return (
@@ -83,7 +83,7 @@ function ProtectedRoute({ children, adminOnly = false }: {
   children: React.ReactNode;
   adminOnly?: boolean;
 }) {
-  const { user, loading, profileStatus, role, isAdminOrAbove } = useAuth();
+  const { user, loading, profileStatus, role, isAdminOrAbove, profileFetched } = useAuth();
 
   // 1. Block until hydration is 100 % complete. No escape hatch.
   if (loading) return <FullScreenLoader />;
@@ -94,11 +94,19 @@ function ProtectedRoute({ children, adminOnly = false }: {
   // 3. Suspended — shown even to super_admins (fixed via SQL).
   if (profileStatus === 'suspended') return <PendingApproval suspended />;
 
-  // 4. Approved — DB says so, OR role=super_admin bypasses the status gate.
+  // 4. Profile row missing / RLS-blocked — distinct screen so the user
+  //    knows to fix the schema / RLS, not to wait for an admin approval.
+  //    We ONLY hit this branch after profileFetched=true, i.e. the SELECT
+  //    actually ran and returned nothing (or errored out).
+  if (profileFetched && role === null && profileStatus === null) {
+    return <PendingApproval profileMissing />;
+  }
+
+  // 5. Approved — DB says so, OR role=super_admin bypasses the status gate.
   const approved = profileStatus === 'approved' || isAutoApproved(role);
   if (!approved) return <PendingApproval />;
 
-  // 5. Admin-only gate.
+  // 6. Admin-only gate.
   if (adminOnly && !isAdminOrAbove) return <Navigate to="/dashboard" replace />;
 
   return <AppLayout>{children}</AppLayout>;

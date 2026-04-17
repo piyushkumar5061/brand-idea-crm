@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { supabase } from '@/integrations/supabase/client';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -35,7 +34,12 @@ function withAuthTimeout<T>(p: PromiseLike<T>, label: string): Promise<T> {
 }
 
 export default function Login() {
-  const navigate = useNavigate();
+  // NOTE: We intentionally don't use useNavigate. After a successful sign-in
+  // Supabase fires onAuthStateChange, which flows through useAuth → AuthRoute,
+  // and AuthRoute's <Navigate to="/dashboard"> does the redirect for us once
+  // hydration is complete. Navigating manually here caused a race where
+  // ProtectedRoute rendered before `user` was populated and bounced back to
+  // /login, producing a confusing flash.
   const [mode, setMode] = useState<AuthMode>('password');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -69,9 +73,9 @@ export default function Login() {
       console.log('[Login] Password login result:', { hasSession: !!data?.session, error });
       if (error) { console.error('[Login] ❌ Password error:', error); throw error; }
       toast.success('Welcome back!');
-      // Don't wait for AuthRoute to redirect — do it ourselves so the user
-      // lands on /dashboard even if useAuth hydration is slow.
-      navigate('/dashboard', { replace: true });
+      // AuthRoute will redirect to /dashboard once useAuth reports the new user.
+      // We keep `loading=true` on the button until that happens so the user
+      // sees "Signing in…" instead of a briefly enabled button.
     } catch (err: any) {
       const msg = err?.message || 'Login failed';
       console.error('[Login] 💥 Password login threw:', err);
@@ -140,11 +144,8 @@ export default function Login() {
         throw synthetic;
       }
       toast.success('Welcome back!');
-      // Explicit navigate — don't rely on AuthRoute's user-redirect fallback.
-      // If useAuth is still hydrating, the router-level spinner would otherwise
-      // keep the login page visible and the user thinks nothing happened.
-      console.log('[Login] ✅ OTP verified — navigating to /dashboard');
-      navigate('/dashboard', { replace: true });
+      // AuthRoute redirects once useAuth reports the new user — no manual nav.
+      console.log('[Login] ✅ OTP verified — waiting for AuthRoute redirect');
     } catch (err: any) {
       const msg = err?.message || 'Invalid or expired code';
       console.error('[Login] 💥 handleVerifyOtp threw:', err);
