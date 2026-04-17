@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query';
 import { supabase } from '@/integrations/supabase/client';
@@ -191,6 +191,7 @@ export default function Leads() {
     retry: 1,
     retryDelay: 500,
     queryFn: async () => {
+      console.log('[Leads] 📥 Fetching leads — key:', leadsQueryKey[1]);
       let query = supabase
         .from('leads')
         .select(
@@ -245,14 +246,42 @@ export default function Leads() {
       // Bounded: if the request hangs (missing table, RLS recursion, network
       // hiccup) we reject after LEADS_QUERY_TIMEOUT_MS instead of spinning
       // forever. React Query will then flip isError=true and isLoading=false.
-      const { data, count, error } = await withTimeout(query, LEADS_QUERY_TIMEOUT_MS, 'leads');
-      if (error) {
-        console.error('[Leads] supabase error:', error);
-        throw error;
+      try {
+        const { data, count, error } = await withTimeout(query, LEADS_QUERY_TIMEOUT_MS, 'leads');
+        if (error) {
+          console.error('[Leads] ❌ supabase error:', error);
+          throw error;
+        }
+        console.log('[Leads] ✅ Leads fetched:', { rows: data?.length ?? 0, total: count ?? 0 });
+        return { rows: (data as Lead[]) ?? [], total: count ?? 0 };
+      } catch (e) {
+        console.error('[Leads] 💥 queryFn threw — surfacing to React Query:', e);
+        throw e;
       }
-      return { rows: (data as Lead[]) ?? [], total: count ?? 0 };
     },
   });
+
+  // ── Component-level kill switch ──────────────────────────────────────────
+  // React Query owns `isLoading` — we can't force it false — but we can
+  // refuse to keep rendering the skeleton after 3 s. `loadingExpired` flips
+  // the body over to the error-state card so the user is NEVER trapped on a
+  // spinner, even if React Query, Supabase, or withTimeout all failed us.
+  const [loadingExpired, setLoadingExpired] = useState(false);
+  useEffect(() => {
+    if (!isLoading) { setLoadingExpired(false); return; }
+    console.log('[Leads] ⏳ isLoading=true — arming 3 s kill switch');
+    const timer = setTimeout(() => {
+      console.warn('[Leads] 🛟 KILL SWITCH: isLoading still true after 3 s — forcing error UI');
+      setLoadingExpired(true);
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [isLoading]);
+
+  // Log whenever the query transitions state so a silent hang is *visible*.
+  useEffect(() => {
+    if (isError) console.error('[Leads] query state: isError=true, error=', leadsError);
+    else if (!isLoading && leadsData) console.log('[Leads] query state: success, rows=', leadsData.rows.length);
+  }, [isLoading, isError, leadsData, leadsError]);
 
   const leads = leadsData?.rows ?? [];
   const totalCount = leadsData?.total ?? 0;
@@ -884,12 +913,15 @@ export default function Leads() {
 
       {/* ══════════════════════════════════════════════════════════════════════
           BODY: List / Kanban / Funnel
-          State priority: ERROR > LOADING > EMPTY > view-specific render.
+          State priority: ERROR (or kill-switch) > LOADING > EMPTY > views.
          ══════════════════════════════════════════════════════════════════════ */}
-      {isError ? (
+      {(isError || (isLoading && loadingExpired)) ? (
         (() => {
-          const missing = isMissingRelationError(leadsError);
-          const msg = leadsError instanceof Error ? leadsError.message : String(leadsError);
+          const expired = isLoading && loadingExpired && !isError;
+          const missing = !expired && isMissingRelationError(leadsError);
+          const msg = expired
+            ? `Leads request is still pending after 3 s. The most likely causes are a missing public.leads table, an RLS recursion on profiles, or an unreachable Supabase instance. Check the console for the full breadcrumb trail.`
+            : leadsError instanceof Error ? leadsError.message : String(leadsError);
           return (
             <Card className="border-destructive/40">
               <CardContent className="py-10 px-6 text-center space-y-3">
@@ -898,10 +930,12 @@ export default function Leads() {
                 </div>
                 <div className="space-y-1">
                   <h3 className="font-semibold">
-                    {missing ? 'Leads table not found' : 'Couldn\'t load leads'}
+                    {expired ? 'Still loading…' : missing ? 'Leads table not found' : 'Couldn\'t load leads'}
                   </h3>
                   <p className="text-sm text-muted-foreground max-w-lg mx-auto">
-                    {missing
+                    {expired
+                      ? 'The fetch has been pending for more than 3 seconds. We stopped waiting so you\'re not trapped on a spinner. Retry, or check the console for the full trail.'
+                      : missing
                       ? 'The public.leads table doesn\'t exist in this Supabase project yet. Run the setup SQL (in the project docs) in the Supabase SQL Editor — then hit Retry.'
                       : 'Supabase returned an error or the request timed out. The full message is below, and in the browser console.'}
                   </p>
@@ -910,7 +944,7 @@ export default function Leads() {
                   {msg}
                 </pre>
                 <div className="flex items-center justify-center gap-2">
-                  <Button size="sm" variant="outline" onClick={() => refetch()}>
+                  <Button size="sm" variant="outline" onClick={() => { setLoadingExpired(false); refetch(); }}>
                     <RefreshCw className="w-3.5 h-3.5 mr-1" /> Retry
                   </Button>
                 </div>

@@ -58,13 +58,40 @@ export const useAuth = () => useContext(AuthContext);
 // ---------------------------------------------------------------------------
 const PROFILE_FETCH_TIMEOUT_MS = 2000;  // per profiles SELECT
 const HARD_LOADING_CAP_MS      = 3000;  // outermost "you are unblocked NOW" fuse
+const FOUNDER_EMAIL = 'piyushkumar5061@gmail.com';
+
+/**
+ * Founder escape hatch. If the profile fetch returns null/timeout for the
+ * founder email, we synthesise a super_admin/approved profile in-memory so
+ * the UI never degrades to "Member"/"Team" + employee sidebar for the
+ * account that has to be able to fix the DB in the first place.
+ *
+ * This is additive — the DB row is still the source of truth for everyone
+ * else, and if the founder's real row says anything other than null, we
+ * respect it (including a suspended override).
+ */
+function applyFounderFallback(profile: ProfileData, email: string | undefined): ProfileData {
+  if (email !== FOUNDER_EMAIL) return profile;
+  if (profile.role !== null && profile.status !== null) return profile;
+  console.warn(
+    '[useAuth] 🔑 FOUNDER FALLBACK ENGAGED — profiles row was null/timeout for',
+    email, '— synthesising { role: super_admin, status: approved } locally.',
+    'Previous profile:', profile,
+  );
+  return {
+    role:    profile.role    ?? 'super_admin',
+    status:  profile.status  ?? 'approved',
+    fetched: true,
+  };
+}
 
 /** Fetcher can only resolve (never reject) — caller never needs try/catch. */
 async function fetchProfileSafe(userId: string): Promise<ProfileData> {
+  console.log('[useAuth] 🔍 fetchProfileSafe START — userId:', userId);
   const timeoutPromise = new Promise<ProfileData>((resolve) =>
     setTimeout(() => {
       console.warn(
-        `[useAuth] profile fetch timed out after ${PROFILE_FETCH_TIMEOUT_MS}ms ` +
+        `[useAuth] ⏱ profile fetch timed out after ${PROFILE_FETCH_TIMEOUT_MS}ms ` +
         '— proceeding with null role (session remains valid)'
       );
       resolve({ role: null, status: null, fetched: true });
@@ -73,15 +100,17 @@ async function fetchProfileSafe(userId: string): Promise<ProfileData> {
 
   const queryPromise: Promise<ProfileData> = (async () => {
     try {
+      console.log('[useAuth] → supabase.from(profiles).select for user', userId);
       const { data, error } = await supabase
         .from('profiles')
         .select('role, status')
         .eq('user_id', userId)
         .maybeSingle();
+      console.log('[useAuth] ← supabase profiles result:', { data, error });
 
       if (error) {
         console.error(
-          '[useAuth] profiles SELECT error — table may not exist or RLS is blocking it.\n' +
+          '[useAuth] ❌ profiles SELECT error — table may not exist or RLS is blocking it.\n' +
           'Run brand_idea_init.sql in Supabase SQL Editor. Raw error:', error,
         );
         return { role: null, status: null, fetched: true };
@@ -89,7 +118,7 @@ async function fetchProfileSafe(userId: string): Promise<ProfileData> {
 
       if (!data) {
         console.warn(
-          '[useAuth] No profiles row found for user', userId,
+          '[useAuth] ⚠️  No profiles row found for user', userId,
           '— INSERT a row via the emergency SQL or re-run brand_idea_init.sql',
         );
         return { role: null, status: null, fetched: true };
@@ -97,10 +126,10 @@ async function fetchProfileSafe(userId: string): Promise<ProfileData> {
 
       const r = (data.role   as AppRole       | undefined) ?? null;
       const s = (data.status as ProfileStatus | undefined) ?? null;
-      console.info('[useAuth] profile loaded →', { role: r, status: s, userId });
+      console.info('[useAuth] ✅ profile loaded →', { role: r, status: s, userId });
       return { role: r, status: s, fetched: true };
     } catch (e) {
-      console.error('[useAuth] fetchProfile threw unexpectedly:', e);
+      console.error('[useAuth] 💥 fetchProfile threw unexpectedly:', e);
       return { role: null, status: null, fetched: true };
     }
   })();
@@ -153,12 +182,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // This is the critical path for the refresh bug. We MUST exit loading,
     // regardless of whether getSession() resolves, rejects, or hangs.
     const hydrate = async () => {
+      console.log('[useAuth] 🚀 Auth Hydration Started');
       try {
+        console.log('[useAuth] → supabase.auth.getSession()');
         const { data, error } = await supabase.auth.getSession();
-        if (!mounted) return;
+        console.log('[useAuth] ← getSession result:', { hasSession: !!data?.session, email: data?.session?.user?.email, error });
+        if (!mounted) { console.log('[useAuth] hydrate: component unmounted mid-flight'); return; }
 
         if (error) {
-          console.error('[useAuth] getSession() returned an error:', error);
+          console.error('[useAuth] ❌ getSession() returned an error:', error);
           settleNoSession();
           return;
         }
@@ -168,25 +200,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser(existing?.user ?? null);
 
         if (!existing?.user) {
+          console.log('[useAuth] hydrate: no session → settling as logged-out');
           settleNoSession();
           return;
         }
 
         // Session exists → fetch profile (itself bounded by 2 s).
         const profile = await fetchProfile(existing.user.id);
+        console.log('[useAuth] 📦 Profile Fetch Result:', profile);
         if (!mounted) return;
-        settle(profile);
+        const effective = applyFounderFallback(profile, existing.user.email);
+        console.log('[useAuth] 🏁 settling with effective profile:', effective);
+        settle(effective);
       } catch (e) {
         // getSession() itself threw (rare, but possible on corrupted localStorage).
-        console.error('[useAuth] hydrate() threw:', e);
+        console.error('[useAuth] 💥 hydrate() threw:', e);
         if (mounted) settleNoSession();
       } finally {
         // Belt-and-suspenders: even if every branch above were to forget to
         // settle, this guarantees loading dies. No infinite spinner — ever.
         if (mounted && !hasSettledRef.current) {
-          console.warn('[useAuth] hydrate finally: force-settling (no branch settled)');
+          console.warn('[useAuth] 🛟 hydrate finally: force-settling (no branch settled)');
           settleNoSession();
         }
+        console.log('[useAuth] ✓ Hydration complete, hasSettled=', hasSettledRef.current);
       }
     };
 
@@ -216,11 +253,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // internal auth lock (documented gotcha).
         setTimeout(async () => {
           try {
+            console.log('[useAuth] auth-event → fetchProfile for', newSession.user.email);
             const profile = await fetchProfile(newSession.user.id);
+            console.log('[useAuth] auth-event Profile Fetch Result:', profile);
             if (!mounted) return;
-            settle(profile);
+            const effective = applyFounderFallback(profile, newSession.user.email);
+            console.log('[useAuth] auth-event settling with:', effective);
+            settle(effective);
           } catch (e) {
-            console.error('[useAuth] onAuthStateChange profile fetch threw:', e);
+            console.error('[useAuth] 💥 onAuthStateChange profile fetch threw:', e);
             if (mounted) settleNoSession();
           } finally {
             // Guarantee: spinner dies after any SIGNED_IN event, even if
