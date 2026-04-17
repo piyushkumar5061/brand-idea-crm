@@ -518,13 +518,15 @@ export default function Leads() {
       onClick={() => navigate(`/leads/${lead.id}`)}
     >
       <CardContent className="flex items-center gap-3 py-3">
-        {isAdminOrAbove && (
-          <Checkbox
-            checked={selectedLeads.has(lead.id)}
-            onCheckedChange={() => toggleSelect(lead.id)}
-            onClick={e => e.stopPropagation()}
-          />
-        )}
+        {/* Row-level checkbox — always rendered so the user can pick leads
+            regardless of role hydration state. RLS on the server is the real
+            gate for whether a delete actually commits. */}
+        <Checkbox
+          checked={selectedLeads.has(lead.id)}
+          onCheckedChange={() => toggleSelect(lead.id)}
+          onClick={e => e.stopPropagation()}
+          aria-label={`Select ${lead.name}`}
+        />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-medium text-sm">{lead.name}</span>
@@ -582,14 +584,13 @@ export default function Leads() {
     >
       <CardContent className="p-3 space-y-2">
         <div className="flex items-start gap-2">
-          {isAdminOrAbove && (
-            <Checkbox
-              checked={selectedLeads.has(lead.id)}
-              onCheckedChange={() => toggleSelect(lead.id)}
-              onClick={e => e.stopPropagation()}
-              className="mt-0.5"
-            />
-          )}
+          <Checkbox
+            checked={selectedLeads.has(lead.id)}
+            onCheckedChange={() => toggleSelect(lead.id)}
+            onClick={e => e.stopPropagation()}
+            className="mt-0.5"
+            aria-label={`Select ${lead.name}`}
+          />
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium truncate">{lead.name}</p>
             <p className="text-xs text-muted-foreground truncate">{lead.phone}</p>
@@ -856,13 +857,15 @@ export default function Leads() {
 
         {/* Prominent bulk-delete — only rendered when rows are selected.
             Sits inline with the filter bar so it's always visible at the top
-            of the page while making a selection. Uses the same hardened
-            confirmAndBulkDelete → deleteSelected path as the toolbars below. */}
-        {isAdminOrAbove && selectedLeads.size > 0 && (
+            of the page while making a selection. No admin gate: the RLS
+            policy on public.leads is the real authorization boundary, and
+            hiding the button on a stale `isAdminOrAbove=false` from an auth
+            hydration race was the bug that made this disappear. */}
+        {selectedLeads.size > 0 && (
           <Button
             size="sm"
             variant="destructive"
-            className="h-8 text-xs"
+            className="h-8 text-xs font-medium shadow-sm"
             onClick={confirmAndBulkDelete}
             disabled={deleting}
             title="Delete every lead you've selected"
@@ -890,12 +893,13 @@ export default function Leads() {
           SELECTION TOOLBAR — Select All / Deselect All visible in EVERY view
           (List, Kanban, Funnel) so bulk-delete works regardless of layout.
          ══════════════════════════════════════════════════════════════════════ */}
-      {isAdminOrAbove && leads.length > 0 && (
+      {leads.length > 0 && (
         <div className="flex flex-wrap items-center gap-3 mb-3 px-1">
           <label className="flex items-center gap-2 cursor-pointer select-none">
             <Checkbox
               checked={selectedLeads.size === leads.length && leads.length > 0}
               onCheckedChange={toggleSelectAll}
+              aria-label="Select all leads on this page"
             />
             <span className="text-xs font-medium text-muted-foreground">
               {selectedLeads.size === leads.length ? 'Deselect all' : 'Select all'}
@@ -934,7 +938,7 @@ export default function Leads() {
       {/* ══════════════════════════════════════════════════════════════════════
           BULK ACTION BAR — school-sales-buddy (preserved) + Deselect All.
          ══════════════════════════════════════════════════════════════════════ */}
-      {isAdminOrAbove && selectedLeads.size > 0 && (
+      {selectedLeads.size > 0 && (
         <Card className="mb-4">
           <CardContent className="flex flex-col sm:flex-row items-start sm:items-center gap-3 py-3">
             <span className="text-sm font-medium">{selectedLeads.size} selected</span>
@@ -1072,11 +1076,12 @@ export default function Leads() {
               <div key={stage.key} className="bg-muted/20 border rounded-lg p-2 min-h-40 space-y-2">
                 <div className="flex items-center justify-between px-1 py-0.5 gap-2">
                   <div className="flex items-center gap-2 min-w-0">
-                    {isAdminOrAbove && stage.items.length > 0 && (
+                    {stage.items.length > 0 && (
                       <Checkbox
                         checked={allStageSelected}
                         onCheckedChange={() => toggleSelectStage(stage.items)}
                         title={allStageSelected ? 'Deselect stage' : 'Select stage'}
+                        aria-label={`Select all ${stage.label} leads`}
                       />
                     )}
                     <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground truncate">
@@ -1106,14 +1111,13 @@ export default function Leads() {
                 stage.items.length > 0 && stage.items.every(l => selectedLeads.has(l.id));
               return (
                 <div key={stage.key} className="flex items-center gap-3">
-                  {isAdminOrAbove && (
-                    <Checkbox
-                      checked={allStageSelected}
-                      onCheckedChange={() => toggleSelectStage(stage.items)}
-                      disabled={stage.items.length === 0}
-                      title={allStageSelected ? 'Deselect stage' : 'Select stage'}
-                    />
-                  )}
+                  <Checkbox
+                    checked={allStageSelected}
+                    onCheckedChange={() => toggleSelectStage(stage.items)}
+                    disabled={stage.items.length === 0}
+                    title={allStageSelected ? 'Deselect stage' : 'Select stage'}
+                    aria-label={`Select all ${stage.label} leads`}
+                  />
                   <div className="w-24 text-xs font-medium text-muted-foreground shrink-0">
                     {stage.label}
                   </div>
@@ -1133,7 +1137,7 @@ export default function Leads() {
             })}
             <p className="text-[11px] text-muted-foreground pt-2 border-t mt-3">
               Funnel is computed from the current page's {leads.length} lead{leads.length === 1 ? '' : 's'} — apply filters or raise the page size to widen the slice.
-              {isAdminOrAbove && ' Use the checkboxes to bulk-select a stage, then delete from the selection toolbar.'}
+              {' '}Use the checkboxes to bulk-select a stage, then delete from the selection toolbar.
             </p>
           </CardContent>
         </Card>
