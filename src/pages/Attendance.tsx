@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   format, parseISO, startOfMonth, endOfMonth, subMonths, isAfter,
@@ -28,6 +28,89 @@ import {
   CalendarDays, CheckCircle2, XCircle, Plus, Pencil, Save, Users2, Wand2, Filter,
   CalendarCheck, Phone, PhoneCall, Trophy, Timer,
 } from 'lucide-react';
+
+// ---------------------------------------------------------------------------
+// Shared timeout + logging scaffolding
+// ---------------------------------------------------------------------------
+// Attendance leans on two RPCs and two tables that DIDN'T EXIST in the new
+// Supabase project — a missing relation makes Supabase's JS client hang
+// indefinitely, which in turn wedges React Query's `isLoading`. We hard-cap
+// every queryFn so the spinner dies within a known budget (5 s per query,
+// plus a component-level 3 s kill switch that flips the UI to the error state).
+const ATT_QUERY_TIMEOUT_MS = 5000;
+
+function withAttTimeout<T>(p: PromiseLike<T>, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`[Attendance:${label}] timed out after ${ATT_QUERY_TIMEOUT_MS}ms — the table/RPC may be missing.`)),
+      ATT_QUERY_TIMEOUT_MS,
+    );
+    Promise.resolve(p).then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+/** Heuristic — distinguishes "table/RPC missing" from everything else so we
+ *  can render a more actionable error state. */
+function attMissingSchema(err: unknown): boolean {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: string }).code ?? '';
+  return (
+    code === '42P01' ||
+    code === 'PGRST202' || // PostgREST "Could not find function in schema"
+    /relation .* does not exist/i.test(msg) ||
+    /could not find (the )?function/i.test(msg) ||
+    /timed out/i.test(msg)
+  );
+}
+
+/** Tiny inline error card so each tab degrades gracefully. */
+function AttErrorCard({ title, error, onRetry }: {
+  title: string;
+  error: unknown;
+  onRetry?: () => void;
+}) {
+  const missing = attMissingSchema(error);
+  const msg = error instanceof Error ? error.message : String(error ?? 'Unknown');
+  return (
+    <Card className="border-destructive/40">
+      <CardContent className="py-8 text-center space-y-2">
+        <p className="font-medium">{title}</p>
+        <p className="text-xs text-muted-foreground max-w-md mx-auto">
+          {missing
+            ? 'The Attendance schema (attendance_logs / leave_requests / the two RPCs) looks like it hasn\'t been applied to this Supabase project. Run the brand_idea_attendance.sql migration in the SQL Editor, then retry.'
+            : 'The fetch failed or timed out. Check the console for the full breadcrumb trail.'}
+        </p>
+        <pre className="text-[11px] bg-muted/40 rounded p-2 max-w-xl mx-auto text-left overflow-auto">{msg}</pre>
+        {onRetry && (
+          <Button size="sm" variant="outline" onClick={onRetry}>Retry</Button>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Arms a 3 s component-level kill switch while `isLoading` is true. Returns
+ * `expired=true` when the timer fires so the caller can force-render an
+ * error / empty state instead of an eternal skeleton.
+ */
+function useAttLoadingKillSwitch(isLoading: boolean, label: string): boolean {
+  const [expired, setExpired] = useState(false);
+  useEffect(() => {
+    if (!isLoading) { setExpired(false); return; }
+    console.log(`[Attendance:${label}] ⏳ isLoading=true — arming 3 s kill switch`);
+    const t = setTimeout(() => {
+      console.warn(`[Attendance:${label}] 🛟 KILL SWITCH — forcing error UI after 3 s`);
+      setExpired(true);
+    }, 3000);
+    return () => clearTimeout(t);
+  }, [isLoading, label]);
+  return expired;
+}
 
 // ---------- status vocabulary ----------
 const STATUS_OPTIONS = [
@@ -209,19 +292,38 @@ function EmployeeView() {
   const todayIso = format(new Date(), 'yyyy-MM-dd');
   const clampedEnd = isAfter(end, new Date()) ? todayIso : endIso;
 
-  const { data: attendance = [], isLoading: attLoading } = useQuery<EmployeeHistoryRow[]>({
+  const {
+    data: attendance = [],
+    isLoading: attLoading,
+    isError: attError,
+    error: attErrObj,
+    refetch: refetchAtt,
+  } = useQuery<EmployeeHistoryRow[]>({
     queryKey: ['attendance-self', user?.id, startIso, clampedEnd],
     enabled: !!user,
+    retry: 1,
+    retryDelay: 500,
     queryFn: async () => {
-      const { data, error } = await (supabase as any).rpc('employee_attendance_history', {
-        p_user_id: user!.id,
-        p_start: startIso,
-        p_end: clampedEnd,
-      });
-      if (error) throw error;
-      return (data as EmployeeHistoryRow[]) ?? [];
+      console.log('[Attendance:self] 📥 RPC employee_attendance_history', { user: user?.id, startIso, clampedEnd });
+      try {
+        const { data, error } = await withAttTimeout(
+          (supabase as any).rpc('employee_attendance_history', {
+            p_user_id: user!.id,
+            p_start: startIso,
+            p_end: clampedEnd,
+          }),
+          'employee_attendance_history',
+        );
+        if (error) { console.error('[Attendance:self] ❌ rpc error', error); throw error; }
+        console.log('[Attendance:self] ✅ rows:', (data as unknown[] | null)?.length ?? 0);
+        return (data as EmployeeHistoryRow[]) ?? [];
+      } catch (e) {
+        console.error('[Attendance:self] 💥 queryFn threw:', e);
+        throw e;
+      }
     },
   });
+  const attExpired = useAttLoadingKillSwitch(attLoading, 'self');
 
   // An employee's "real" records are days with an attendance_id. Future/empty
   // months still return scaffold rows, so gate the empty-state on whether
@@ -253,7 +355,13 @@ function EmployeeView() {
             </div>
           </CardHeader>
           <CardContent>
-            {attLoading ? (
+            {(attError || (attLoading && attExpired)) ? (
+              <AttErrorCard
+                title="Couldn't load your attendance"
+                error={attErrObj ?? new Error('Request exceeded 3 s — forcing error UI.')}
+                onRetry={() => refetchAtt()}
+              />
+            ) : attLoading ? (
               <Skeleton className="h-40 w-full" />
             ) : !hasRealData ? (
               <div className="py-10 text-center space-y-1">
@@ -318,19 +426,38 @@ function EmployeeLeaves() {
   const [reason, setReason]       = useState('');
   const [submitting, setSubmitting] = useState(false);
 
-  const { data: leaves = [], isLoading } = useQuery<LeaveRow[]>({
+  const {
+    data: leaves = [],
+    isLoading,
+    isError: leavesError,
+    error: leavesErrObj,
+    refetch: refetchLeaves,
+  } = useQuery<LeaveRow[]>({
     queryKey: ['leave-self', user?.id],
     enabled: !!user,
+    retry: 1,
+    retryDelay: 500,
     queryFn: async () => {
-      const { data, error } = await (supabase as any)
-        .from('leave_requests')
-        .select('id, user_id, start_date, end_date, reason, status, created_at, reviewed_at')
-        .eq('user_id', user!.id)
-        .order('created_at', { ascending: false });
-      if (error) throw error;
-      return (data as LeaveRow[]) ?? [];
+      console.log('[Attendance:leaves-self] 📥 SELECT leave_requests for', user?.id);
+      try {
+        const { data, error } = await withAttTimeout(
+          (supabase as any)
+            .from('leave_requests')
+            .select('id, user_id, start_date, end_date, reason, status, created_at, reviewed_at')
+            .eq('user_id', user!.id)
+            .order('created_at', { ascending: false }),
+          'leave_requests:self',
+        );
+        if (error) { console.error('[Attendance:leaves-self] ❌', error); throw error; }
+        console.log('[Attendance:leaves-self] ✅ rows:', (data as unknown[] | null)?.length ?? 0);
+        return (data as LeaveRow[]) ?? [];
+      } catch (e) {
+        console.error('[Attendance:leaves-self] 💥 threw:', e);
+        throw e;
+      }
     },
   });
+  const leavesExpired = useAttLoadingKillSwitch(isLoading, 'leaves-self');
 
   const submit = async () => {
     if (!startDate || !endDate || !reason.trim()) { toast.error('All fields are required'); return; }
@@ -392,7 +519,13 @@ function EmployeeLeaves() {
         </Dialog>
       </CardHeader>
       <CardContent>
-        {isLoading ? <Skeleton className="h-40 w-full" /> : leaves.length === 0 ? (
+        {(leavesError || (isLoading && leavesExpired)) ? (
+          <AttErrorCard
+            title="Couldn't load leave requests"
+            error={leavesErrObj ?? new Error('Request exceeded 3 s — forcing error UI.')}
+            onRetry={() => refetchLeaves()}
+          />
+        ) : isLoading ? <Skeleton className="h-40 w-full" /> : leaves.length === 0 ? (
           <p className="text-sm text-muted-foreground">No leave requests yet.</p>
         ) : (
           <Table>
@@ -477,17 +610,36 @@ function AdminMasterTable({
   const todayIso = format(new Date(), 'yyyy-MM-dd');
   const clampedEnd = isAfter(end, new Date()) ? todayIso : endIso;
 
-  const { data: rows = [], isLoading } = useQuery<AttendanceMasterRow[]>({
+  const {
+    data: rows = [],
+    isLoading,
+    isError: masterError,
+    error: masterErrObj,
+    refetch: refetchMaster,
+  } = useQuery<AttendanceMasterRow[]>({
     queryKey: ['attendance-master', startIso, clampedEnd],
+    retry: 1,
+    retryDelay: 500,
     queryFn: async () => {
-      const { data, error } = await (supabase as any).rpc('admin_attendance_for_range', {
-        p_start: startIso,
-        p_end:   clampedEnd,
-      });
-      if (error) throw error;
-      return (data as AttendanceMasterRow[]) ?? [];
+      console.log('[Attendance:master] 📥 RPC admin_attendance_for_range', { startIso, clampedEnd });
+      try {
+        const { data, error } = await withAttTimeout(
+          (supabase as any).rpc('admin_attendance_for_range', {
+            p_start: startIso,
+            p_end:   clampedEnd,
+          }),
+          'admin_attendance_for_range',
+        );
+        if (error) { console.error('[Attendance:master] ❌ rpc error', error); throw error; }
+        console.log('[Attendance:master] ✅ rows:', (data as unknown[] | null)?.length ?? 0);
+        return (data as AttendanceMasterRow[]) ?? [];
+      } catch (e) {
+        console.error('[Attendance:master] 💥 queryFn threw:', e);
+        throw e;
+      }
     },
   });
+  const masterExpired = useAttLoadingKillSwitch(isLoading, 'master');
 
   const hasAnyRealData = rows.some(
     r => r.attendance_id || r.total_calls > 0 || r.connected_calls > 0 || r.deals_closed > 0,
@@ -589,7 +741,13 @@ function AdminMasterTable({
           scopeLabel={scopeLabel}
         />
 
-        {isLoading ? <Skeleton className="h-60 w-full" /> : (
+        {(masterError || (isLoading && masterExpired)) ? (
+          <AttErrorCard
+            title="Couldn't load the attendance master"
+            error={masterErrObj ?? new Error('Request exceeded 3 s — forcing error UI.')}
+            onRetry={() => refetchMaster()}
+          />
+        ) : isLoading ? <Skeleton className="h-60 w-full" /> : (
           <div className="overflow-x-auto">
             <Table>
               <TableHeader>
@@ -677,10 +835,21 @@ function AdminBulkUpdate() {
 
   const { data: profiles = [] } = useQuery<ProfileLite[]>({
     queryKey: ['profiles-for-bulk'],
+    retry: 1,
+    retryDelay: 500,
     queryFn: async () => {
-      const { data, error } = await supabase.from('profiles').select('user_id, full_name, email');
-      if (error) throw error;
-      return (data as ProfileLite[]) ?? [];
+      console.log('[Attendance:bulk-profiles] 📥');
+      try {
+        const { data, error } = await withAttTimeout(
+          supabase.from('profiles').select('user_id, full_name, email'),
+          'profiles',
+        );
+        if (error) { console.error('[Attendance:bulk-profiles] ❌', error); throw error; }
+        return (data as ProfileLite[]) ?? [];
+      } catch (e) {
+        console.error('[Attendance:bulk-profiles] 💥 threw:', e);
+        return [];
+      }
     },
   });
 
@@ -908,23 +1077,52 @@ function EditRecordDialog({ row, date }: { row: AttendanceMasterRow; date: strin
 function AdminLeaveRequests() {
   const queryClient = useQueryClient();
 
-  const { data: leaves = [], isLoading } = useQuery<LeaveRow[]>({
+  const {
+    data: leaves = [],
+    isLoading,
+    isError: adminLeavesError,
+    error: adminLeavesErrObj,
+    refetch: refetchAdminLeaves,
+  } = useQuery<LeaveRow[]>({
     queryKey: ['leave-admin-all'],
+    retry: 1,
+    retryDelay: 500,
     queryFn: async () => {
-      const { data, error } = await (supabase as any)
-        .from('leave_requests')
-        .select('id, user_id, start_date, end_date, reason, status, created_at, reviewed_at')
-        .order('created_at', { ascending: false });
-      if (error) throw error;
-      return (data as LeaveRow[]) ?? [];
+      console.log('[Attendance:leaves-admin] 📥 SELECT leave_requests (all)');
+      try {
+        const { data, error } = await withAttTimeout(
+          (supabase as any)
+            .from('leave_requests')
+            .select('id, user_id, start_date, end_date, reason, status, created_at, reviewed_at')
+            .order('created_at', { ascending: false }),
+          'leave_requests:all',
+        );
+        if (error) { console.error('[Attendance:leaves-admin] ❌', error); throw error; }
+        console.log('[Attendance:leaves-admin] ✅ rows:', (data as unknown[] | null)?.length ?? 0);
+        return (data as LeaveRow[]) ?? [];
+      } catch (e) {
+        console.error('[Attendance:leaves-admin] 💥 threw:', e);
+        throw e;
+      }
     },
   });
+  const adminLeavesExpired = useAttLoadingKillSwitch(isLoading, 'leaves-admin');
 
   const { data: profiles = [] } = useQuery<ProfileLite[]>({
     queryKey: ['profiles-basic'],
+    retry: 1,
+    retryDelay: 500,
     queryFn: async () => {
-      const { data } = await supabase.from('profiles').select('user_id, full_name, email');
-      return data ?? [];
+      try {
+        const { data } = await withAttTimeout(
+          supabase.from('profiles').select('user_id, full_name, email'),
+          'profiles-basic',
+        );
+        return (data as ProfileLite[]) ?? [];
+      } catch (e) {
+        console.error('[Attendance:profiles-basic] 💥 threw:', e);
+        return [];
+      }
     },
   });
   const nameFor = (uid: string) => {
@@ -945,7 +1143,13 @@ function AdminLeaveRequests() {
     <Card>
       <CardHeader><CardTitle className="text-lg">Leave Requests</CardTitle></CardHeader>
       <CardContent>
-        {isLoading ? <Skeleton className="h-40 w-full" /> : leaves.length === 0 ? (
+        {(adminLeavesError || (isLoading && adminLeavesExpired)) ? (
+          <AttErrorCard
+            title="Couldn't load leave requests"
+            error={adminLeavesErrObj ?? new Error('Request exceeded 3 s — forcing error UI.')}
+            onRetry={() => refetchAdminLeaves()}
+          />
+        ) : isLoading ? <Skeleton className="h-40 w-full" /> : leaves.length === 0 ? (
           <p className="text-sm text-muted-foreground">No leave requests yet.</p>
         ) : (
           <Table>

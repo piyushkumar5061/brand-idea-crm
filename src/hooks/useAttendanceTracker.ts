@@ -58,26 +58,60 @@ export function useAttendanceTracker(): UseAttendanceTrackerResult {
   const refresh = useCallback(async () => {
     if (!user) { setLoading(false); return; }
     setLoading(true);
-    const { data } = await (supabase as any)
-      .from('attendance_logs')
-      .select('id, user_id, date, clock_in, clock_out, status, approval_status, active_crm_minutes')
-      .eq('user_id', user.id)
-      .eq('date', today_iso)
-      .maybeSingle();
-    if (data) {
-      setToday(data as AttendanceTodayRow);
-      rowIdRef.current     = data.id;
-      minutesRef.current   = data.active_crm_minutes ?? 0;
-      setActiveMinutes(minutesRef.current);
-      clockedInRef.current = !!data.clock_in && !data.clock_out;
-    } else {
+    console.log('[AttendanceTracker] 🔍 refresh — user', user.id, 'date', today_iso);
+
+    // Bound the SELECT so a missing attendance_logs table or RLS recursion
+    // cannot freeze the sidebar clock-in button forever.
+    const REFRESH_TIMEOUT_MS = 3000;
+    const guarded = new Promise<{ data: unknown | null; error: unknown }>((resolve) => {
+      const t = setTimeout(() => {
+        console.warn('[AttendanceTracker] ⏱ refresh timed out after 3 s — assuming no row');
+        resolve({ data: null, error: new Error('attendance_logs fetch timed out') });
+      }, REFRESH_TIMEOUT_MS);
+      (supabase as any)
+        .from('attendance_logs')
+        .select('id, user_id, date, clock_in, clock_out, status, approval_status, active_crm_minutes')
+        .eq('user_id', user.id)
+        .eq('date', today_iso)
+        .maybeSingle()
+        .then((res: { data: unknown | null; error: unknown }) => {
+          clearTimeout(t);
+          resolve(res);
+        }, (err: unknown) => {
+          clearTimeout(t);
+          resolve({ data: null, error: err });
+        });
+    });
+
+    try {
+      const { data, error } = await guarded;
+      if (error) console.error('[AttendanceTracker] ❌ refresh error:', error);
+      if (data) {
+        const row = data as AttendanceTodayRow;
+        console.log('[AttendanceTracker] ✅ row loaded', row.id);
+        setToday(row);
+        rowIdRef.current     = row.id;
+        minutesRef.current   = row.active_crm_minutes ?? 0;
+        setActiveMinutes(minutesRef.current);
+        clockedInRef.current = !!row.clock_in && !row.clock_out;
+      } else {
+        setToday(null);
+        rowIdRef.current     = null;
+        minutesRef.current   = 0;
+        setActiveMinutes(0);
+        clockedInRef.current = false;
+      }
+    } catch (e) {
+      console.error('[AttendanceTracker] 💥 refresh threw:', e);
       setToday(null);
       rowIdRef.current     = null;
       minutesRef.current   = 0;
       setActiveMinutes(0);
       clockedInRef.current = false;
+    } finally {
+      // INVARIANT: spinner always dies, even if the query hung or threw.
+      setLoading(false);
     }
-    setLoading(false);
   }, [user, today_iso]);
 
   useEffect(() => { refresh(); }, [refresh]);
