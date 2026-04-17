@@ -26,7 +26,7 @@ interface TeamMember {
 
 export default function Team() {
   const { isAdminOrAbove, user } = useAuth();
-  const canManage = isAdminOrAbove || user?.email === 'piyushkumar5061@gmail.com';
+  const canManage = isAdminOrAbove;
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [newEmail, setNewEmail] = useState('');
   const [newPassword, setNewPassword] = useState('');

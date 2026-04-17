@@ -264,8 +264,8 @@ const CURRENT_MONTH_KEY = format(new Date(), 'yyyy-MM');
 // Main page component — routes to Employee or Admin view
 // ===========================================================================
 export default function Attendance() {
-  const { isAdminOrAbove, user } = useAuth();
-  const isAdmin = isAdminOrAbove || user?.email === 'piyushkumar5061@gmail.com';
+  const { isAdminOrAbove } = useAuth();
+  const isAdmin = isAdminOrAbove;
 
   return (
     <div>

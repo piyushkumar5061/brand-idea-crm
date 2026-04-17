@@ -3,7 +3,7 @@ import { BrowserRouter, Route, Routes, Navigate } from "react-router-dom";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { AuthProvider, useAuth, FOUNDER_EMAIL } from "@/hooks/useAuth";
+import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import AppLayout from "@/components/AppLayout";
 import LandingPage from "@/pages/LandingPage";
 import PendingApproval from "@/pages/PendingApproval";
@@ -41,13 +41,12 @@ function FullScreenLoader() {
 }
 
 /**
- * Auto-approved if the user is the founder (email match) OR holds the
- * super_admin role. Either alone is sufficient — the founder can never be
- * locked out by a missing/RLS-blocked profile row because the email check
- * runs independently of the DB.
+ * Auto-approved if the user's DB role is super_admin. 100 % database-driven —
+ * no hardcoded email overrides. A super_admin never needs a separate
+ * profile.status='approved' flag to enter the CRM.
  */
-function isAutoApproved(userEmail: string | undefined, role: string | null): boolean {
-  return userEmail === FOUNDER_EMAIL || role === 'super_admin';
+function isAutoApproved(role: string | null): boolean {
+  return role === 'super_admin';
 }
 
 // ---------------------------------------------------------------------------
@@ -95,13 +94,12 @@ function ProtectedRoute({ children, adminOnly = false }: {
   // 3. Suspended — shown even to super_admins (fixed via SQL).
   if (profileStatus === 'suspended') return <PendingApproval suspended />;
 
-  // 4. Approved — DB says so, OR founder/super_admin bypass.
-  const approved = profileStatus === 'approved' || isAutoApproved(user.email, role);
+  // 4. Approved — DB says so, OR role=super_admin bypasses the status gate.
+  const approved = profileStatus === 'approved' || isAutoApproved(role);
   if (!approved) return <PendingApproval />;
 
   // 5. Admin-only gate.
-  const hasAdminAccess = isAdminOrAbove || isAutoApproved(user.email, role);
-  if (adminOnly && !hasAdminAccess) return <Navigate to="/dashboard" replace />;
+  if (adminOnly && !isAdminOrAbove) return <Navigate to="/dashboard" replace />;
 
   return <AppLayout>{children}</AppLayout>;
 }

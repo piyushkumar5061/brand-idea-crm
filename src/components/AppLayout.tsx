@@ -10,8 +10,6 @@ import {
 } from 'lucide-react';
 import ClockInOutButton from '@/components/ClockInOutButton';
 
-const FOUNDER_EMAIL = 'piyushkumar5061@gmail.com';
-
 // ---------------------------------------------------------------------------
 // Sidebar link definitions
 // ---------------------------------------------------------------------------
@@ -52,11 +50,10 @@ const employeeLinks = [
 ];
 
 // ---------------------------------------------------------------------------
-// Role badge resolver — NEVER shows the wrong role.
-// Order: founder-email override → explicit role → safe fallback.
+// Role badge resolver — 100 % DB-driven. Whatever role useAuth reports is
+// what we show. No email overrides.
 // ---------------------------------------------------------------------------
-function resolveRoleLabel(email: string | undefined, role: string | null): string {
-  if (email === FOUNDER_EMAIL) return 'Super Admin';
+function resolveRoleLabel(role: string | null): string {
   if (!role) return 'Member';
   return role.replace(/_/g, ' ');
 }
@@ -66,16 +63,12 @@ export default function AppLayout({ children }: { children: ReactNode }) {
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
 
-  // Bulletproof: founder email OR any admin+ role sees the full sidebar.
-  const isAdmin =
-    isAdminOrAbove ||
-    role === 'super_admin' ||
-    role === 'admin' ||
-    role === 'manager' ||
-    user?.email === FOUNDER_EMAIL;
+  // Admin sidebar whenever the DB role is admin-tier. useAuth.isAdminOrAbove
+  // already encapsulates this; the redundant role checks were legacy.
+  const isAdmin = isAdminOrAbove;
 
   const links = isAdmin ? adminLinks : employeeLinks;
-  const roleLabel = resolveRoleLabel(user?.email, role);
+  const roleLabel = resolveRoleLabel(role);
 
   return (
     <div className="min-h-screen flex">
