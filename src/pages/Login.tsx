@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { supabase } from '@/integrations/supabase/client';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -9,17 +10,44 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { toast } from 'sonner';
-import { GraduationCap, KeyRound, Mail, ArrowLeft } from 'lucide-react';
+import { GraduationCap, KeyRound, Mail, ArrowLeft, AlertTriangle } from 'lucide-react';
 
 type AuthMode = 'password' | 'otp';
 
+/**
+ * Wraps any PromiseLike so it rejects after `ms` instead of hanging forever.
+ * Supabase's JS client has been observed to wedge on verifyOtp when the
+ * network flaps or the project URL is unreachable — without this, the
+ * `finally` block below never runs and the button stays "Verifying…" forever.
+ */
+const AUTH_TIMEOUT_MS = 10000;
+function withAuthTimeout<T>(p: PromiseLike<T>, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`[auth:${label}] timed out after ${AUTH_TIMEOUT_MS}ms — check your network / Supabase URL.`)),
+      AUTH_TIMEOUT_MS,
+    );
+    Promise.resolve(p).then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 export default function Login() {
+  const navigate = useNavigate();
   const [mode, setMode] = useState<AuthMode>('password');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [otp, setOtp] = useState('');
   const [otpSent, setOtpSent] = useState(false);
   const [loading, setLoading] = useState(false);
+  /**
+   * Inline auth error — rendered above the button in addition to the toast,
+   * because toasts disappear and users miss them. This is the surface that
+   * tells the user WHY their OTP submit failed.
+   */
+  const [authError, setAuthError] = useState<string | null>(null);
 
   // Forgot password modal
   const [forgotOpen, setForgotOpen] = useState(false);
@@ -31,16 +59,26 @@ export default function Login() {
     e.preventDefault();
     if (!email.trim() || !password) { toast.error('Email and password required'); return; }
     setLoading(true);
+    setAuthError(null);
+    console.log('[Login] 🔐 Password login started for', email.trim());
     try {
-      const { error } = await supabase.auth.signInWithPassword({
-        email: email.trim(),
-        password,
-      });
-      if (error) throw error;
+      const { data, error } = await withAuthTimeout(
+        supabase.auth.signInWithPassword({ email: email.trim(), password }),
+        'signInWithPassword',
+      );
+      console.log('[Login] Password login result:', { hasSession: !!data?.session, error });
+      if (error) { console.error('[Login] ❌ Password error:', error); throw error; }
       toast.success('Welcome back!');
+      // Don't wait for AuthRoute to redirect — do it ourselves so the user
+      // lands on /dashboard even if useAuth hydration is slow.
+      navigate('/dashboard', { replace: true });
     } catch (err: any) {
-      toast.error(err.message || 'Login failed');
+      const msg = err?.message || 'Login failed';
+      console.error('[Login] 💥 Password login threw:', err);
+      setAuthError(msg);
+      toast.error(msg);
     } finally {
+      // INVARIANT: button is re-enabled no matter what happens above.
       setLoading(false);
     }
   };
@@ -48,16 +86,25 @@ export default function Login() {
   const handleSendOtp = async () => {
     if (!email.trim()) { toast.error('Enter your email first'); return; }
     setLoading(true);
+    setAuthError(null);
+    console.log('[Login] ✉️ signInWithOtp — requesting code for', email.trim());
     try {
-      const { error } = await supabase.auth.signInWithOtp({
-        email: email.trim(),
-        options: { shouldCreateUser: false },
-      });
-      if (error) throw error;
+      const { error } = await withAuthTimeout(
+        supabase.auth.signInWithOtp({
+          email: email.trim(),
+          options: { shouldCreateUser: false },
+        }),
+        'signInWithOtp',
+      );
+      console.log('[Login] signInWithOtp result — error:', error);
+      if (error) { console.error('[Login] ❌ OTP send error:', error); throw error; }
       setOtpSent(true);
       toast.success('Check your email for the login code');
     } catch (err: any) {
-      toast.error(err.message || 'Failed to send OTP');
+      const msg = err?.message || 'Failed to send OTP';
+      console.error('[Login] 💥 signInWithOtp threw:', err);
+      setAuthError(msg);
+      toast.error(msg);
     } finally {
       setLoading(false);
     }
@@ -65,18 +112,49 @@ export default function Login() {
 
   const handleVerifyOtp = async () => {
     if (!otp || otp.length < 6) { toast.error('Enter the 6-digit code from your email'); return; }
+    console.log('[Login] 🔑 OTP Verification started for', email.trim());
     setLoading(true);
+    setAuthError(null);
     try {
-      const { error } = await supabase.auth.verifyOtp({
-        email: email.trim(),
-        token: otp.trim(),
-        type: 'email',
-      });
-      if (error) throw error;
+      // verifyOtp is the call that has wedged in the wild — 10 s timeout so
+      // the button can never be stuck on "Verifying…" forever.
+      const { data, error } = await withAuthTimeout(
+        supabase.auth.verifyOtp({
+          email: email.trim(),
+          token: otp.trim(),
+          type: 'email',
+        }),
+        'verifyOtp',
+      );
+      console.log('[Login] OTP Result:', { hasSession: !!data?.session, userId: data?.user?.id, error });
+      if (error) {
+        console.error('[Login] ❌ OTP Error:', error);
+        throw error;
+      }
+      if (!data?.session) {
+        // Supabase sometimes returns { data:{session:null}, error:null } on a
+        // silent rate-limit / config issue. Treat that as a failure so the UI
+        // doesn't proceed to a dead redirect.
+        const synthetic = new Error('Verification succeeded but no session was returned. Double-check the code or request a new one.');
+        console.error('[Login] ❌ OTP verified but no session:', synthetic);
+        throw synthetic;
+      }
       toast.success('Welcome back!');
+      // Explicit navigate — don't rely on AuthRoute's user-redirect fallback.
+      // If useAuth is still hydrating, the router-level spinner would otherwise
+      // keep the login page visible and the user thinks nothing happened.
+      console.log('[Login] ✅ OTP verified — navigating to /dashboard');
+      navigate('/dashboard', { replace: true });
     } catch (err: any) {
-      toast.error(err.message || 'Invalid or expired code');
+      const msg = err?.message || 'Invalid or expired code';
+      console.error('[Login] 💥 handleVerifyOtp threw:', err);
+      setAuthError(msg);
+      toast.error(msg);
     } finally {
+      // CRITICAL INVARIANT: regardless of success, failure, timeout, or
+      // "no session returned" branch above — the button is always re-enabled
+      // so the user can retry without having to reload the page.
+      console.log('[Login] 🏁 handleVerifyOtp finally — setLoading(false)');
       setLoading(false);
     }
   };
@@ -111,12 +189,20 @@ export default function Login() {
           <CardDescription>Sign in to your account</CardDescription>
         </CardHeader>
         <CardContent>
+          {authError && (
+            <div className="mb-4 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              <span className="break-words">{authError}</span>
+            </div>
+          )}
+
           <Tabs
             value={mode}
             onValueChange={v => {
               setMode(v as AuthMode);
               setOtpSent(false);
               setOtp('');
+              setAuthError(null);
             }}
           >
             <TabsList className="grid grid-cols-2 w-full mb-4">
