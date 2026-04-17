@@ -6,14 +6,29 @@ export type AppRole = 'super_admin' | 'admin' | 'manager' | 'employee';
 export type ProfileStatus = 'pending' | 'approved' | 'suspended';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 100 % DATABASE-DRIVEN
+// 100 % DATABASE-DRIVEN — permanent fix
 // ─────────────────────────────────────────────────────────────────────────────
-// No hardcoded email overrides, no "god-mode" short-circuits. The auth state
-// is derived exclusively from:
-//   1. supabase.auth.getSession()          → session + user
-//   2. public.profiles WHERE user_id = …   → role + status
-// If either step fails, role/status stay null — consumers surface that as
-// "awaiting approval" / "unauthorized". No silent upgrade to super_admin.
+// Earlier revisions called `supabase.auth.getSession()` directly AND subscribed
+// to `onAuthStateChange`. That combination had three failure modes:
+//
+//   1. getSession() has been observed to hang indefinitely on some networks
+//      (Supabase issue tracker has many reports). Its 5 s timeout would then
+//      treat the user as logged-out, even when they weren't.
+//   2. Calling supabase.from(...).select() inside the auth listener could
+//      deadlock the auth lock. We masked it with setTimeout(0) but the code
+//      path was fragile.
+//   3. Double-settling when INITIAL_SESSION and hydrate() both fired.
+//
+// The new implementation follows the Supabase-recommended pattern exactly:
+//   - onAuthStateChange is the SINGLE source of truth.
+//   - INITIAL_SESSION (fired once immediately on subscribe) handles hydration.
+//   - SIGNED_IN / SIGNED_OUT / TOKEN_REFRESHED / USER_UPDATED handle changes.
+//   - Every Supabase call that could block is wrapped in withTimeout + setTimeout
+//     so the listener itself never holds the auth lock.
+//
+// Plus a definitive SAFETY CAP: if `loading` is still true after 12 seconds,
+// we forcibly flip it to false so the user is NEVER permanently stuck on the
+// full-screen loader.
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface ProfileData {
@@ -27,11 +42,6 @@ interface AuthContextType {
   session: Session | null;
   role: AppRole | null;
   profileStatus: ProfileStatus | null;
-  /**
-   * True until BOTH getSession AND the profile SELECT have definitively
-   * resolved. Never flips to false while a profile fetch is still pending —
-   * protected routes block on this, so no "default to Team" flash.
-   */
   loading: boolean;
   profileFetched: boolean;
   isAdminOrAbove: boolean;
@@ -52,13 +62,11 @@ const AuthContext = createContext<AuthContextType>({
 export const useAuth = () => useContext(AuthContext);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Timing budgets. Longer than before — the previous short fuse was racing the
-// real DB response on slow networks and masquerading as "auth broken".
+// Timing budgets.
 // ─────────────────────────────────────────────────────────────────────────────
-const GET_SESSION_TIMEOUT_MS   = 5000;
-const PROFILE_FETCH_TIMEOUT_MS = 5000;
+const PROFILE_FETCH_TIMEOUT_MS = 4000;   // single DB select
+const HARD_HYDRATION_CAP_MS    = 12000;  // absolute maximum time on the loader
 
-/** Race a promise against a hard timer — never hangs past `ms`. */
 function withTimeout<T>(p: PromiseLike<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(
@@ -73,10 +81,9 @@ function withTimeout<T>(p: PromiseLike<T>, ms: number, label: string): Promise<T
 }
 
 /**
- * Fetch the authenticated user's profile row — SELECT role, status FROM
- * public.profiles WHERE user_id = userId. Never rejects: any failure (RLS,
- * missing table, timeout, exception) resolves to `{role:null, status:null,
- * fetched:true}`. The caller always gets a terminal answer.
+ * SELECT role, status FROM public.profiles WHERE user_id = :userId
+ * Never rejects. On any failure (RLS, missing row, timeout, throw) returns
+ * `{role:null, status:null, fetched:true}`.
  */
 async function fetchProfile(userId: string): Promise<ProfileData> {
   console.log('[useAuth] 🔍 fetchProfile — user_id =', userId);
@@ -115,23 +122,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [profileFetched, setProfileFetched] = useState(false);
   const [loading, setLoading]               = useState(true);
 
-  const mountedRef = useRef(true);
-  // Track the last user id we fully resolved. Used to distinguish a real
-  // identity change (login / user switch) from a token-refresh event where
-  // the role hasn't changed and we don't need to flip loading=true.
+  const mountedRef    = useRef(true);
   const lastUserIdRef = useRef<string | null>(null);
+  // Monotonic counter so stale profile fetches (e.g. a slow fetch for a
+  // previous user id) never clobber the current state.
+  const fetchTokenRef = useRef(0);
 
-  /**
-   * The ONLY setter path. Writes the DB-returned role/status verbatim.
-   * React 18 auto-batches the six setState calls, so every consumer of
-   * useAuth() sees a coherent snapshot the moment loading flips to false.
-   */
+  /** Atomic setter. All consumers see a coherent snapshot when loading flips. */
   const applyAuthState = useCallback((
     newSession: Session | null,
     profile: ProfileData,
   ) => {
     if (!mountedRef.current) return;
-
     setSession(newSession);
     setUser(newSession?.user ?? null);
     setRole(profile.role);
@@ -139,7 +141,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setProfileFetched(profile.fetched);
     setLoading(false);
     lastUserIdRef.current = newSession?.user?.id ?? null;
-
     console.log('[useAuth] 🏁 applyAuthState', {
       user: newSession?.user?.email ?? null,
       role: profile.role,
@@ -149,52 +150,35 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     mountedRef.current = true;
+    console.log('[useAuth] 🚀 provider mount — subscribing to onAuthStateChange');
 
-    // ── Hydration (on page load / refresh) ──────────────────────────────
-    const hydrate = async () => {
-      console.log('[useAuth] 🚀 hydrate start');
-
-      // Step 1: who are we?
-      let sess: Session | null = null;
-      try {
-        const { data, error } = await withTimeout(
-          supabase.auth.getSession(),
-          GET_SESSION_TIMEOUT_MS,
-          'getSession',
-        );
-        if (error) throw error;
-        sess = data?.session ?? null;
-        console.log('[useAuth] ← getSession', { hasSession: !!sess, email: sess?.user?.email });
-      } catch (e) {
-        console.error('[useAuth] ❌ getSession failed — treating as logged-out:', e);
-        sess = null;
-      }
-
+    // ── Absolute safety cap ─────────────────────────────────────────────
+    // If anything below wedges and `loading` is still true after 12 s,
+    // force it false so the app can at least render /login. No permanent
+    // full-screen-loader trap is possible.
+    const safetyTimer = setTimeout(() => {
       if (!mountedRef.current) return;
+      setLoading(prev => {
+        if (!prev) return prev;
+        console.error('[useAuth] 🛟 SAFETY CAP — loading still true after', HARD_HYDRATION_CAP_MS, 'ms, forcing false');
+        return false;
+      });
+      // If we're uncorking with no session resolved, make sure downstream
+      // consumers see a terminal profileFetched=true so ProtectedRoute can
+      // route to /login (no user) rather than a blank page.
+      setProfileFetched(true);
+    }, HARD_HYDRATION_CAP_MS);
 
-      // Step 2: no session → settle as logged-out.
-      if (!sess?.user) {
-        applyAuthState(null, { role: null, status: null, fetched: true });
-        return;
-      }
-
-      // Step 3: fetch the profile BEFORE flipping loading=false.
-      // loading stays true through this await — no "default to Team" window.
-      const profile = await fetchProfile(sess.user.id);
-      if (!mountedRef.current) return;
-      applyAuthState(sess, profile);
-    };
-
-    // ── Auth events (sign-in, sign-out, token refresh) ──────────────────
+    // ── onAuthStateChange IS the source of truth ────────────────────────
+    // Supabase fires INITIAL_SESSION once immediately on subscribe, carrying
+    // whatever session is in localStorage. That's our hydration signal — we
+    // no longer call getSession() separately (it has been observed to hang).
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (event, newSession) => {
         if (!mountedRef.current) return;
-        console.log('[useAuth] 🔔 auth event', event, newSession?.user?.email);
+        console.log('[useAuth] 🔔 auth event', event, newSession?.user?.email ?? '(none)');
 
-        // hydrate() owns INITIAL_SESSION; ignoring prevents a double-settle race.
-        if (event === 'INITIAL_SESSION') return;
-
-        // Sign-out / session ended → clear.
+        // Sign-out / no session → settle as logged-out.
         if (!newSession?.user) {
           applyAuthState(null, { role: null, status: null, fetched: true });
           return;
@@ -203,19 +187,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const incomingUid = newSession.user.id;
         const sameUser = lastUserIdRef.current === incomingUid;
 
-        // TOKEN_REFRESHED / USER_UPDATED for the already-resolved user →
-        // update the session silently, refetch the profile in the background,
-        // DO NOT flip loading=true (that would flash the FullScreenLoader
-        // on every hour-ish when the access token rotates).
-        if (sameUser && event !== 'SIGNED_IN') {
-          console.log('[useAuth] ↻ background refresh — same user, no loader');
+        // Background refresh: same user, token rotated. Don't flash the
+        // loader; just update session and refetch the profile silently.
+        if (sameUser && event !== 'SIGNED_IN' && event !== 'INITIAL_SESSION') {
+          console.log('[useAuth] ↻ background refresh — no loader');
           setSession(newSession);
           setUser(newSession.user);
+          const token = ++fetchTokenRef.current;
           setTimeout(async () => {
             const profile = await fetchProfile(incomingUid);
             if (!mountedRef.current) return;
-            // Only update role/status if the fetch actually returned data;
-            // a transient RLS/timeout shouldn't wipe a known-good role.
+            if (token !== fetchTokenRef.current) return; // stale
             if (profile.role !== null || profile.status !== null) {
               setRole(profile.role);
               setProfileStatus(profile.status);
@@ -226,34 +208,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        // Identity change (fresh login OR user switch) → block with the
-        // loader, fetch the profile, then settle atomically.
+        // Fresh identity (INITIAL_SESSION with a session, or SIGNED_IN) →
+        // block with the loader, fetch the profile, settle atomically.
+        // setTimeout(0) is critical: it drops us out of the auth listener
+        // BEFORE we call supabase.from(...), which avoids the known
+        // auth-lock deadlock.
         setLoading(true);
+        const token = ++fetchTokenRef.current;
         setTimeout(async () => {
           const profile = await fetchProfile(incomingUid);
           if (!mountedRef.current) return;
+          if (token !== fetchTokenRef.current) return; // stale — newer event superseded us
           applyAuthState(newSession, profile);
         }, 0);
       },
     );
 
-    hydrate();
-
     return () => {
       mountedRef.current = false;
+      clearTimeout(safetyTimer);
       subscription.unsubscribe();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const signOut = useCallback(async () => {
-    // Remote sign-out first — revokes the refresh token server-side.
     try { await supabase.auth.signOut(); }
     catch (e) { console.error('[useAuth] signOut (remote) threw:', e); }
-
-    // Belt-and-braces: wipe any residual Supabase auth keys from localStorage.
-    // If the remote call failed (network flap, expired token) the keys would
-    // otherwise remain and getSession() would revive the session on reload.
     try {
       const keys: string[] = [];
       for (let i = 0; i < localStorage.length; i++) {
@@ -265,7 +246,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       console.warn('[useAuth] localStorage cleanup threw:', e);
     }
-
     if (mountedRef.current) {
       setSession(null);
       setUser(null);
@@ -273,12 +253,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setProfileStatus(null);
       lastUserIdRef.current = null;
     }
-    // Hard-navigate so every hook, query-client cache, and component tree
-    // is rebuilt from a clean slate. Avoids stale-data bleed-through bugs.
     window.location.href = '/login';
   }, []);
 
-  // Derived: strictly from the role column. No email overrides.
   const isAdminOrAbove =
     role === 'super_admin' ||
     role === 'admin' ||
