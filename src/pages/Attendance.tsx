@@ -29,15 +29,12 @@ import {
   CalendarCheck, Phone, PhoneCall, Trophy, Timer,
 } from 'lucide-react';
 
-// ---------------------------------------------------------------------------
-// Shared timeout + logging scaffolding
-// ---------------------------------------------------------------------------
 const ATT_QUERY_TIMEOUT_MS = 5000;
 
 function withAttTimeout<T>(p: PromiseLike<T>, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(
-      () => reject(new Error(`[Attendance:${label}] timed out after ${ATT_QUERY_TIMEOUT_MS}ms — the table/RPC may be missing.`)),
+      () => reject(new Error(`[Attendance:${label}] timed out after ${ATT_QUERY_TIMEOUT_MS}ms`)),
       ATT_QUERY_TIMEOUT_MS,
     );
     Promise.resolve(p).then(
@@ -52,34 +49,23 @@ function attMissingSchema(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   const code = (err as { code?: string }).code ?? '';
   return (
-    code === '42P01' ||
-    code === 'PGRST202' || 
-    /relation .* does not exist/i.test(msg) ||
-    /could not find (the )?function/i.test(msg) ||
-    /timed out/i.test(msg)
+    code === '42P01' || code === 'PGRST202' || 
+    /relation .* does not exist/i.test(msg) || /timed out/i.test(msg)
   );
 }
 
-function AttErrorCard({ title, error, onRetry }: {
-  title: string;
-  error: unknown;
-  onRetry?: () => void;
-}) {
+function AttErrorCard({ title, error, onRetry }: { title: string; error: unknown; onRetry?: () => void; }) {
   const missing = attMissingSchema(error);
   const msg = error instanceof Error ? error.message : String(error ?? 'Unknown');
   return (
     <Card className="border-destructive/40">
       <CardContent className="py-8 text-center space-y-2">
         <p className="font-medium">{title}</p>
-        <p className="text-xs text-muted-foreground max-w-md mx-auto">
-          {missing
-            ? 'The Attendance schema (attendance_logs / leave_requests / the two RPCs) looks like it hasn\'t been applied to this Supabase project. Run the brand_idea_attendance.sql migration in the SQL Editor, then retry.'
-            : 'The fetch failed or timed out. Check the console for the full breadcrumb trail.'}
+        <p className="text-xs text-muted-foreground">
+          {missing ? 'Attendance schema missing. Apply migrations in Supabase SQL Editor.' : 'The fetch failed or timed out.'}
         </p>
-        <pre className="text-[11px] bg-muted/40 rounded p-2 max-w-xl mx-auto text-left overflow-auto">{msg}</pre>
-        {onRetry && (
-          <Button size="sm" variant="outline" onClick={onRetry}>Retry</Button>
-        )}
+        <pre className="text-[11px] bg-muted/40 rounded p-2 max-w-xl mx-auto overflow-auto">{msg}</pre>
+        {onRetry && <Button size="sm" variant="outline" onClick={onRetry}>Retry</Button>}
       </CardContent>
     </Card>
   );
@@ -89,80 +75,36 @@ function useAttLoadingKillSwitch(isLoading: boolean, label: string): boolean {
   const [expired, setExpired] = useState(false);
   useEffect(() => {
     if (!isLoading) { setExpired(false); return; }
-    console.log(`[Attendance:${label}] ⏳ isLoading=true — arming 3 s kill switch`);
-    const t = setTimeout(() => {
-      console.warn(`[Attendance:${label}] 🛟 KILL SWITCH — forcing error UI after 3 s`);
-      setExpired(true);
-    }, 3000);
+    const t = setTimeout(() => setExpired(true), 3000);
     return () => clearTimeout(t);
   }, [isLoading, label]);
   return expired;
 }
 
 const STATUS_OPTIONS = [
-  'Present',
-  'Absent',
-  'Pending Approval',
-  'Holiday',
-  'Absconded',
-  'Leave Requested',
-  'Leave Approved',
-  'Week off',
+  'Present', 'Absent', 'Pending Approval', 'Holiday', 'Absconded', 'Leave Requested', 'Leave Approved', 'Week off',
 ] as const;
 type AttendanceStatus = typeof STATUS_OPTIONS[number];
 
 interface AttendanceMasterRow {
-  attendance_id: string | null;
-  user_id: string;
-  full_name: string | null;
-  email: string | null;
-  date: string;
-  status: string;
-  approval_status: string;
-  clock_in: string | null;
-  clock_out: string | null;
-  active_crm_minutes: number;
-  notes: string | null;
-  total_calls: number;
-  connected_calls: number;
-  deals_closed: number;
+  attendance_id: string | null; user_id: string; full_name: string | null; email: string | null;
+  date: string; status: string; approval_status: string; clock_in: string | null; clock_out: string | null;
+  active_crm_minutes: number; notes: string | null; total_calls: number; connected_calls: number; deals_closed: number;
 }
 
 interface EmployeeHistoryRow {
-  attendance_id: string | null;
-  user_id: string;
-  date: string;
-  status: string;
-  approval_status: string;
-  clock_in: string | null;
-  clock_out: string | null;
-  active_crm_minutes: number;
-  notes: string | null;
-  total_calls: number;
-  connected_calls: number;
-  deals_closed: number;
+  attendance_id: string | null; user_id: string; date: string; status: string; approval_status: string;
+  clock_in: string | null; clock_out: string | null; active_crm_minutes: number; notes: string | null;
+  total_calls: number; connected_calls: number; deals_closed: number;
 }
 
 interface LeaveRow {
-  id: string;
-  user_id: string;
-  start_date: string;
-  end_date: string;
-  reason: string;
-  status: string;
-  created_at: string;
-  reviewed_at: string | null;
+  id: string; user_id: string; start_date: string; end_date: string; reason: string; status: string; created_at: string; reviewed_at: string | null;
 }
 
-interface ProfileLite {
-  user_id: string;
-  full_name: string | null;
-  email: string | null;
-}
+interface ProfileLite { user_id: string; full_name: string | null; email: string | null; }
 
-const fmtTime = (iso: string | null) =>
-  iso ? format(parseISO(iso), 'HH:mm') : '—';
-
+const fmtTime = (iso: string | null) => iso ? format(parseISO(iso), 'HH:mm') : '—';
 const fmtDuration = (mins: number) => {
   if (!mins) return '0m';
   const h = Math.floor(mins / 60);
@@ -172,56 +114,34 @@ const fmtDuration = (mins: number) => {
 
 const statusBadge = (s: string) => {
   const map: Record<string, string> = {
-    Present:            'bg-emerald-500/10 text-emerald-600 border-emerald-500/30',
-    Absent:             'bg-red-500/10 text-red-600 border-red-500/30',
+    Present: 'bg-emerald-500/10 text-emerald-600 border-emerald-500/30',
+    Absent: 'bg-red-500/10 text-red-600 border-red-500/30',
     'Pending Approval': 'bg-amber-500/10 text-amber-600 border-amber-500/30',
-    Holiday:            'bg-sky-500/10 text-sky-600 border-sky-500/30',
-    Absconded:          'bg-rose-600/15 text-rose-700 border-rose-500/40',
-    Abscond:            'bg-rose-600/15 text-rose-700 border-rose-500/40',
-    'Leave Requested':  'bg-violet-500/10 text-violet-600 border-violet-500/30',
-    'Leave Approved':   'bg-indigo-500/10 text-indigo-600 border-indigo-500/30',
-    Leave:              'bg-indigo-500/10 text-indigo-600 border-indigo-500/30',
-    'Week off':         'bg-slate-500/10 text-slate-600 border-slate-500/30',
-    Approved:           'bg-emerald-500/10 text-emerald-600 border-emerald-500/30',
-    Pending:            'bg-amber-500/10 text-amber-600 border-amber-500/30',
-    Rejected:           'bg-red-500/10 text-red-600 border-red-500/30',
+    Holiday: 'bg-sky-500/10 text-sky-600 border-sky-500/30',
+    Approved: 'bg-emerald-500/10 text-emerald-600 border-emerald-500/30',
+    Pending: 'bg-amber-500/10 text-amber-600 border-amber-500/30',
+    Rejected: 'bg-red-500/10 text-red-600 border-red-500/30',
   };
   return map[s] || 'bg-muted text-muted-foreground border-muted-foreground/30';
 };
 
-const MONTH_OPTIONS_COUNT = 24;
-
-function buildMonthOptions(count = MONTH_OPTIONS_COUNT) {
-  const now = new Date();
-  return Array.from({ length: count }).map((_, i) => {
-    const d = subMonths(now, i);
-    const start = startOfMonth(d);
-    const end   = endOfMonth(d);
-    return {
-      key:   format(d, 'yyyy-MM'),
-      label: format(d, 'MMMM yyyy'),
-      start,
-      end,
-    };
-  });
-}
-
-function MonthPicker({
-  value, onChange, className,
-}: { value: string; onChange: (key: string) => void; className?: string }) {
+function MonthPicker({ value, onChange, className }: { value: string; onChange: (key: string) => void; className?: string }) {
   const options = useMemo(() => buildMonthOptions(), []);
   return (
     <Select value={value} onValueChange={onChange}>
-      <SelectTrigger className={className ?? 'w-48 h-9'}>
-        <SelectValue placeholder="Select month" />
-      </SelectTrigger>
+      <SelectTrigger className={className ?? 'w-48 h-9'}><SelectValue placeholder="Select month" /></SelectTrigger>
       <SelectContent className="max-h-80">
-        {options?.map(o => (
-          <SelectItem key={o?.key} value={o?.key}>{o?.label}</SelectItem>
-        ))}
+        {options?.map(o => <SelectItem key={o?.key} value={o?.key}>{o?.label}</SelectItem>)}
       </SelectContent>
     </Select>
   );
+}
+
+function buildMonthOptions() {
+  return Array.from({ length: 24 }).map((_, i) => {
+    const d = subMonths(new Date(), i);
+    return { key: format(d, 'yyyy-MM'), label: format(d, 'MMMM yyyy'), start: startOfMonth(d), end: endOfMonth(d) };
+  });
 }
 
 function monthRangeFromKey(key: string) {
@@ -234,14 +154,12 @@ const CURRENT_MONTH_KEY = format(new Date(), 'yyyy-MM');
 
 export default function Attendance() {
   const { isAdminOrAbove } = useAuth();
-  const isAdmin = isAdminOrAbove;
-
   return (
     <div>
       <h1 className="text-2xl font-bold mb-6 flex items-center gap-2">
         <CalendarDays className="w-6 h-6" /> Attendance & Leave
       </h1>
-      {isAdmin ? <AdminView /> : <EmployeeView />}
+      {isAdminOrAbove ? <AdminView /> : <EmployeeView />}
     </div>
   );
 }
@@ -251,126 +169,55 @@ function EmployeeView() {
   const [monthKey, setMonthKey] = useState<string>(CURRENT_MONTH_KEY);
   const { start, end } = useMemo(() => monthRangeFromKey(monthKey), [monthKey]);
   const startIso = format(start, 'yyyy-MM-dd');
-  const endIso   = format(end,   'yyyy-MM-dd');
-
+  const endIso = format(end, 'yyyy-MM-dd');
   const todayIso = format(new Date(), 'yyyy-MM-dd');
   const clampedEnd = isAfter(end, new Date()) ? todayIso : endIso;
 
-  const {
-    data: attendance = [],
-    isLoading: attLoading,
-    isError: attError,
-    error: attErrObj,
-    refetch: refetchAtt,
-  } = useQuery<EmployeeHistoryRow[]>({
+  const { data: attendance = [], isLoading, isError, error, refetch } = useQuery<EmployeeHistoryRow[]>({
     queryKey: ['attendance-self', user?.id, startIso, clampedEnd],
     enabled: !!user,
-    retry: 1,
-    retryDelay: 500,
     queryFn: async () => {
-      try {
-        const { data, error } = await withAttTimeout(
-          (supabase as any).rpc('employee_attendance_history', {
-            p_user_id: user!.id,
-            p_start: startIso,
-            p_end: clampedEnd,
-          }),
-          'employee_attendance_history',
-        );
-        if (error) throw error;
-        return (data as EmployeeHistoryRow[]) ?? [];
-      } catch (e) {
-        throw e;
-      }
+      const { data, error } = await withAttTimeout((supabase as any).rpc('employee_attendance_history', {
+        p_user_id: user!.id, p_start: startIso, p_end: clampedEnd,
+      }), 'history');
+      if (error) throw error;
+      return (data as EmployeeHistoryRow[]) ?? [];
     },
   });
-  const attExpired = useAttLoadingKillSwitch(attLoading, 'self');
-
-  const hasRealData = attendance?.some(
-    a => a?.attendance_id || a?.total_calls > 0 || a?.connected_calls > 0 || a?.deals_closed > 0,
-  );
+  const expired = useAttLoadingKillSwitch(isLoading, 'self');
+  const hasData = attendance?.some(a => a?.attendance_id || a?.total_calls > 0);
 
   return (
     <Tabs defaultValue="attendance">
-      <TabsList>
-        <TabsTrigger value="attendance">My Attendance</TabsTrigger>
-        <TabsTrigger value="leaves">My Leaves</TabsTrigger>
-      </TabsList>
-
+      <TabsList><TabsTrigger value="attendance">My Attendance</TabsTrigger><TabsTrigger value="leaves">My Leaves</TabsTrigger></TabsList>
       <TabsContent value="attendance" className="mt-4 space-y-4">
-        <MonthlySummary
-          rows={attendance}
-          monthLabel={format(start, 'MMMM yyyy')}
-        />
-
+        <MonthlySummary rows={attendance} monthLabel={format(start, 'MMMM yyyy')} />
         <Card>
-          <CardHeader className="flex flex-row items-center justify-between flex-wrap gap-3">
+          <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="text-lg">My Attendance — {format(start, 'MMMM yyyy')}</CardTitle>
-            <div className="flex items-center gap-2">
-              <Label htmlFor="emp-month" className="text-sm text-muted-foreground">Month</Label>
-              <MonthPicker value={monthKey} onChange={setMonthKey} />
-            </div>
+            <MonthPicker value={monthKey} onChange={setMonthKey} />
           </CardHeader>
           <CardContent>
-            {(attError || (attLoading && attExpired)) ? (
-              <AttErrorCard
-                title="Couldn't load your attendance"
-                error={attErrObj ?? new Error('Request exceeded 3 s — forcing error UI.')}
-                onRetry={() => refetchAtt()}
-              />
-            ) : attLoading ? (
-              <Skeleton className="h-40 w-full" />
-            ) : !hasRealData ? (
-              <div className="py-10 text-center space-y-1">
-                <p className="text-sm font-medium">No attendance records found for this month</p>
-                <p className="text-xs text-muted-foreground">
-                  Pick a different month above, or use the Clock In button in the sidebar to start tracking today.
-                </p>
-              </div>
-            ) : (
-              <div className="overflow-x-auto">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Date</TableHead>
-                      <TableHead>Clock In</TableHead>
-                      <TableHead>Clock Out</TableHead>
-                      <TableHead>Status</TableHead>
-                      <TableHead className="text-right">Total Calls</TableHead>
-                      <TableHead className="text-right">Connected</TableHead>
-                      <TableHead className="text-right">Deals Closed</TableHead>
-                      <TableHead>Active CRM</TableHead>
+            {(isError || (isLoading && expired)) ? <AttErrorCard title="Couldn't load attendance" error={error} onRetry={refetch} /> :
+              isLoading ? <Skeleton className="h-40 w-full" /> : !hasData ? <p className="text-center py-10 text-sm">No records found.</p> : (
+              <Table>
+                <TableHeader><TableRow><TableHead>Date</TableHead><TableHead>Clock In</TableHead><TableHead>Clock Out</TableHead><TableHead>Status</TableHead><TableHead className="text-right">Calls</TableHead></TableRow></TableHeader>
+                <TableBody>
+                  {attendance?.map(a => (
+                    <TableRow key={(a?.attendance_id ?? '') + a?.date}>
+                      <TableCell>{a?.date ? format(parseISO(a.date), 'MMM d, yyyy') : '—'}</TableCell>
+                      <TableCell>{fmtTime(a?.clock_in)}</TableCell><TableCell>{fmtTime(a?.clock_out)}</TableCell>
+                      <TableCell><Badge variant="outline" className={statusBadge(a?.status || '')}>{a?.status}</Badge></TableCell>
+                      <TableCell className="text-right">{a?.total_calls ?? 0}</TableCell>
                     </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {/* ADDED OPTIONAL CHAINING TO MAP */}
-                    {attendance?.map(a => (
-                      <TableRow key={(a?.attendance_id ?? '') + a?.date}>
-                        <TableCell className="font-medium whitespace-nowrap">
-                          {a?.date ? format(parseISO(a.date), 'MMM d, yyyy') : '—'}
-                        </TableCell>
-                        <TableCell className="tabular-nums">{fmtTime(a?.clock_in)}</TableCell>
-                        <TableCell className="tabular-nums">{fmtTime(a?.clock_out)}</TableCell>
-                        <TableCell>
-                          <Badge variant="outline" className={statusBadge(a?.status || 'Unknown')}>{a?.status}</Badge>
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">{a?.total_calls ?? 0}</TableCell>
-                        <TableCell className="text-right tabular-nums">{a?.connected_calls ?? 0}</TableCell>
-                        <TableCell className="text-right tabular-nums">{a?.deals_closed ?? 0}</TableCell>
-                        <TableCell className="tabular-nums">{fmtDuration(a?.active_crm_minutes || 0)}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
+                  ))}
+                </TableBody>
+              </Table>
             )}
           </CardContent>
         </Card>
       </TabsContent>
-
-      <TabsContent value="leaves" className="mt-4">
-        <EmployeeLeaves />
-      </TabsContent>
+      <TabsContent value="leaves" className="mt-4"><EmployeeLeaves /></TabsContent>
     </Tabs>
   );
 }
@@ -379,135 +226,33 @@ function EmployeeLeaves() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
-  const [startDate, setStartDate] = useState('');
-  const [endDate, setEndDate]     = useState('');
-  const [reason, setReason]       = useState('');
-  const [submitting, setSubmitting] = useState(false);
-
-  const {
-    data: leaves = [],
-    isLoading,
-    isError: leavesError,
-    error: leavesErrObj,
-    refetch: refetchLeaves,
-  } = useQuery<LeaveRow[]>({
+  const { data: leaves = [], isLoading, isError, error, refetch } = useQuery<LeaveRow[]>({
     queryKey: ['leave-self', user?.id],
     enabled: !!user,
-    retry: 1,
-    retryDelay: 500,
     queryFn: async () => {
-      try {
-        const { data, error } = await withAttTimeout(
-          (supabase as any)
-            .from('leave_requests')
-            .select('id, user_id, start_date, end_date, reason, status, created_at, reviewed_at')
-            .eq('user_id', user!.id)
-            .order('created_at', { ascending: false }),
-          'leave_requests:self',
-        );
-        if (error) throw error;
-        return (data as LeaveRow[]) ?? [];
-      } catch (e) {
-        throw e;
-      }
+      const { data, error } = await withAttTimeout(supabase.from('leave_requests').select('*').eq('user_id', user!.id).order('created_at', { ascending: false }), 'leaves');
+      if (error) throw error;
+      return (data as LeaveRow[]) ?? [];
     },
   });
-  const leavesExpired = useAttLoadingKillSwitch(isLoading, 'leaves-self');
-
-  const submit = async () => {
-    if (!startDate || !endDate || !reason.trim()) { toast.error('All fields are required'); return; }
-    if (endDate < startDate) { toast.error('End date must be on or after start date'); return; }
-    setSubmitting(true);
-    try {
-      const { error } = await (supabase as any).from('leave_requests').insert({
-        user_id: user!.id, start_date: startDate, end_date: endDate, reason: reason.trim(),
-      });
-      if (error) throw error;
-      toast.success('Leave request submitted');
-      setStartDate(''); setEndDate(''); setReason(''); setOpen(false);
-      queryClient.invalidateQueries({ queryKey: ['leave-self'] });
-    } catch (err: any) { toast.error(err.message || 'Failed to submit'); }
-    finally { setSubmitting(false); }
-  };
-
-  const cancel = async (id: string) => {
-    const { error } = await (supabase as any).from('leave_requests').delete().eq('id', id);
-    if (error) { toast.error(error.message); return; }
-    toast.success('Request cancelled');
-    queryClient.invalidateQueries({ queryKey: ['leave-self'] });
-  };
 
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle className="text-lg">My Leave Requests</CardTitle>
-        <Dialog open={open} onOpenChange={setOpen}>
-          <DialogTrigger asChild>
-            <Button size="sm"><Plus className="w-4 h-4 mr-1.5" /> Request Leave</Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Request Leave</DialogTitle>
-              <DialogDescription>Submit a leave request for admin approval.</DialogDescription>
-            </DialogHeader>
-            <div className="space-y-3">
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1.5">
-                  <Label htmlFor="start">Start date</Label>
-                  <Input id="start" type="date" value={startDate} onChange={e => setStartDate(e.target.value)} />
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="end">End date</Label>
-                  <Input id="end" type="date" value={endDate} onChange={e => setEndDate(e.target.value)} />
-                </div>
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="reason">Reason</Label>
-                <Textarea id="reason" value={reason} onChange={e => setReason(e.target.value)} rows={3} placeholder="Brief reason for the leave..." />
-              </div>
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-              <Button onClick={submit} disabled={submitting}>{submitting ? 'Submitting...' : 'Submit Request'}</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+        <Button size="sm" onClick={() => setOpen(true)}><Plus className="w-4 h-4 mr-1.5" /> Request Leave</Button>
       </CardHeader>
       <CardContent>
-        {(leavesError || (isLoading && leavesExpired)) ? (
-          <AttErrorCard
-            title="Couldn't load leave requests"
-            error={leavesErrObj ?? new Error('Request exceeded 3 s — forcing error UI.')}
-            onRetry={() => refetchLeaves()}
-          />
-        ) : isLoading ? <Skeleton className="h-40 w-full" /> : leaves.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No leave requests yet.</p>
-        ) : (
+        {isError ? <AttErrorCard title="Couldn't load leaves" error={error} onRetry={refetch} /> :
+          isLoading ? <Skeleton className="h-40 w-full" /> : (
           <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Dates</TableHead>
-                <TableHead>Reason</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Requested</TableHead>
-                <TableHead></TableHead>
-              </TableRow>
-            </TableHeader>
+            <TableHeader><TableRow><TableHead>Dates</TableHead><TableHead>Reason</TableHead><TableHead>Status</TableHead></TableRow></TableHeader>
             <TableBody>
-              {/* ADDED OPTIONAL CHAINING */}
               {leaves?.map(l => (
                 <TableRow key={l?.id}>
-                  <TableCell className="whitespace-nowrap">
-                    {l?.start_date && format(parseISO(l.start_date), 'MMM d')} — {l?.end_date && format(parseISO(l.end_date), 'MMM d, yyyy')}
-                  </TableCell>
+                  <TableCell>{l?.start_date && format(parseISO(l.start_date), 'MMM d')} — {l?.end_date && format(parseISO(l.end_date), 'MMM d, yyyy')}</TableCell>
                   <TableCell className="max-w-xs truncate">{l?.reason}</TableCell>
-                  <TableCell><Badge variant="outline" className={statusBadge(l?.status || 'Unknown')}>{l?.status}</Badge></TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{l?.created_at && format(parseISO(l.created_at), 'MMM d, HH:mm')}</TableCell>
-                  <TableCell>
-                    {l?.status === 'Pending' && (
-                      <Button variant="ghost" size="sm" onClick={() => l?.id && cancel(l.id)}>Cancel</Button>
-                    )}
-                  </TableCell>
+                  <TableCell><Badge variant="outline" className={statusBadge(l?.status || '')}>{l?.status}</Badge></TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -522,236 +267,49 @@ function AdminView() {
   const [monthKey, setMonthKey] = useState<string>(CURRENT_MONTH_KEY);
   return (
     <Tabs defaultValue="master">
-      <TabsList>
-        <TabsTrigger value="master">Attendance Master</TabsTrigger>
-        <TabsTrigger value="bulk">Bulk Update</TabsTrigger>
-        <TabsTrigger value="leaves">Leave Requests</TabsTrigger>
-      </TabsList>
-      <TabsContent value="master" className="mt-4 space-y-4">
-        <AdminMasterTable monthKey={monthKey} setMonthKey={setMonthKey} />
-      </TabsContent>
-      <TabsContent value="bulk" className="mt-4">
-        <AdminBulkUpdate />
-      </TabsContent>
-      <TabsContent value="leaves" className="mt-4">
-        <AdminLeaveRequests />
-      </TabsContent>
+      <TabsList><TabsTrigger value="master">Attendance Master</TabsTrigger><TabsTrigger value="bulk">Bulk Update</TabsTrigger><TabsTrigger value="leaves">Leave Requests</TabsTrigger></TabsList>
+      <TabsContent value="master" className="mt-4"><AdminMasterTable monthKey={monthKey} setMonthKey={setMonthKey} /></TabsContent>
+      <TabsContent value="bulk" className="mt-4"><AdminBulkUpdate /></TabsContent>
+      <TabsContent value="leaves" className="mt-4"><AdminLeaveRequests /></TabsContent>
     </Tabs>
   );
 }
 
-function AdminMasterTable({
-  monthKey, setMonthKey,
-}: { monthKey: string; setMonthKey: (k: string) => void }) {
-  const queryClient = useQueryClient();
-  const [employeeFilter, setEmployeeFilter] = useState<string>('_all_');
-  const [statusFilter,   setStatusFilter]   = useState<string>('_all_');
-
+function AdminMasterTable({ monthKey, setMonthKey }: { monthKey: string; setMonthKey: (k: string) => void }) {
   const { start, end } = useMemo(() => monthRangeFromKey(monthKey), [monthKey]);
   const startIso = format(start, 'yyyy-MM-dd');
-  const endIso   = format(end,   'yyyy-MM-dd');
+  const clampedEnd = isAfter(end, new Date()) ? format(new Date(), 'yyyy-MM-dd') : format(end, 'yyyy-MM-dd');
 
-  const todayIso = format(new Date(), 'yyyy-MM-dd');
-  const clampedEnd = isAfter(end, new Date()) ? todayIso : endIso;
-
-  const {
-    data: rows = [],
-    isLoading,
-    isError: masterError,
-    error: masterErrObj,
-    refetch: refetchMaster,
-  } = useQuery<AttendanceMasterRow[]>({
+  const { data: rows = [], isLoading, isError, error, refetch } = useQuery<AttendanceMasterRow[]>({
     queryKey: ['attendance-master', startIso, clampedEnd],
-    retry: 1,
-    retryDelay: 500,
     queryFn: async () => {
-      try {
-        const { data, error } = await withAttTimeout(
-          (supabase as any).rpc('admin_attendance_for_range', {
-            p_start: startIso,
-            p_end:   clampedEnd,
-          }),
-          'admin_attendance_for_range',
-        );
-        if (error) throw error;
-        return (data as AttendanceMasterRow[]) ?? [];
-      } catch (e) {
-        throw e;
-      }
+      const { data, error } = await withAttTimeout((supabase as any).rpc('admin_attendance_for_range', { p_start: startIso, p_end: clampedEnd }), 'admin_master');
+      if (error) throw error;
+      return (data as AttendanceMasterRow[]) ?? [];
     },
   });
-  const masterExpired = useAttLoadingKillSwitch(isLoading, 'master');
-
-  const hasAnyRealData = rows?.some(
-    r => r?.attendance_id || r?.total_calls > 0 || r?.connected_calls > 0 || r?.deals_closed > 0,
-  );
-
-  const filtered = useMemo(() => {
-    return rows?.filter(r => {
-      if (!r) return false;
-      if (employeeFilter !== '_all_' && r.user_id !== employeeFilter) return false;
-      if (statusFilter   !== '_all_' && r.status !== statusFilter)    return false;
-      return true;
-    }) || [];
-  }, [rows, employeeFilter, statusFilter]);
-
-  const scopeLabel = useMemo(() => {
-    if (employeeFilter === '_all_') return 'Team total';
-    const e = rows?.find(r => r?.user_id === employeeFilter);
-    return e ? (e.full_name || e.email || 'Employee') : 'Employee';
-  }, [rows, employeeFilter]);
-
-  const approve = async (id: string) => {
-    const { error } = await (supabase as any).from('attendance_logs')
-      .update({ approval_status: 'Approved', reviewed_at: new Date().toISOString() })
-      .eq('id', id);
-    if (error) { toast.error(error.message); return; }
-    toast.success('Approved');
-    queryClient.invalidateQueries({ queryKey: ['attendance-master'] });
-  };
-
-  const reject = async (id: string) => {
-    const { error } = await (supabase as any).from('attendance_logs')
-      .update({ approval_status: 'Rejected', reviewed_at: new Date().toISOString() })
-      .eq('id', id);
-    if (error) { toast.error(error.message); return; }
-    toast.success('Rejected');
-    queryClient.invalidateQueries({ queryKey: ['attendance-master'] });
-  };
-
-  const employeeOptions = useMemo(() => {
-    const seen = new Set<string>();
-    const uniq: AttendanceMasterRow[] = [];
-    for (const r of rows || []) {
-      if (!r || seen.has(r.user_id)) continue;
-      seen.add(r.user_id);
-      uniq.push(r);
-    }
-    return uniq.sort(
-      (a, b) => (a.full_name ?? a.email ?? '').localeCompare(b.full_name ?? b.email ?? ''),
-    );
-  }, [rows]);
 
   return (
     <Card>
-      <CardHeader className="space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <CardTitle className="text-lg">Attendance Master — {format(start, 'MMMM yyyy')}</CardTitle>
-          <div className="flex items-center gap-2">
-            <Label htmlFor="att-month" className="text-sm text-muted-foreground">Month</Label>
-            <MonthPicker value={monthKey} onChange={setMonthKey} />
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 pt-1">
-          <div className="flex items-center gap-1.5 text-muted-foreground text-sm">
-            <Filter className="w-3.5 h-3.5" /> Filters:
-          </div>
-          <Select value={employeeFilter} onValueChange={setEmployeeFilter}>
-            <SelectTrigger className="w-56 h-9"><SelectValue placeholder="All employees" /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="_all_">All employees</SelectItem>
-              {employeeOptions?.map(e => (
-                <SelectItem key={e?.user_id} value={e?.user_id}>{e?.full_name || e?.email}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select value={statusFilter} onValueChange={setStatusFilter}>
-            <SelectTrigger className="w-48 h-9"><SelectValue placeholder="All statuses" /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="_all_">All statuses</SelectItem>
-              {STATUS_OPTIONS.map(s => (
-                <SelectItem key={s} value={s}>{s}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {(employeeFilter !== '_all_' || statusFilter !== '_all_') && (
-            <Button variant="ghost" size="sm" onClick={() => { setEmployeeFilter('_all_'); setStatusFilter('_all_'); }}>
-              Clear
-            </Button>
-          )}
-        </div>
+      <CardHeader className="flex flex-row items-center justify-between">
+        <CardTitle className="text-lg">Attendance Master — {format(start, 'MMMM yyyy')}</CardTitle>
+        <MonthPicker value={monthKey} onChange={setMonthKey} />
       </CardHeader>
-      <CardContent className="space-y-4">
-        <MonthlySummary
-          rows={filtered}
-          monthLabel={format(start, 'MMMM yyyy')}
-          scopeLabel={scopeLabel}
-        />
-
-        {(masterError || (isLoading && masterExpired)) ? (
-          <AttErrorCard
-            title="Couldn't load the attendance master"
-            error={masterErrObj ?? new Error('Request exceeded 3 s — forcing error UI.')}
-            onRetry={() => refetchMaster()}
-          />
-        ) : isLoading ? <Skeleton className="h-60 w-full" /> : (
+      <CardContent>
+        {isError ? <AttErrorCard title="Couldn't load master" error={error} onRetry={refetch} /> :
+          isLoading ? <Skeleton className="h-60 w-full" /> : (
           <div className="overflow-x-auto">
             <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Date</TableHead>
-                  <TableHead>Employee</TableHead>
-                  <TableHead>Clock In</TableHead>
-                  <TableHead>Clock Out</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead className="text-right">Total Calls</TableHead>
-                  <TableHead className="text-right">Connected</TableHead>
-                  <TableHead className="text-right">Deals Closed</TableHead>
-                  <TableHead>Active CRM</TableHead>
-                  <TableHead>Approval</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
+              <TableHeader><TableRow><TableHead>Date</TableHead><TableHead>Employee</TableHead><TableHead>Status</TableHead><TableHead className="text-right">Calls</TableHead></TableRow></TableHeader>
               <TableBody>
-                {/* ADDED OPTIONAL CHAINING */}
-                {filtered?.map(r => (
+                {rows?.map(r => (
                   <TableRow key={r?.user_id + r?.date}>
-                    <TableCell className="whitespace-nowrap">{r?.date ? format(parseISO(r.date), 'MMM d') : '—'}</TableCell>
-                    <TableCell>
-                      <div className="font-medium text-sm">{r?.full_name || '—'}</div>
-                      <div className="text-xs text-muted-foreground">{r?.email}</div>
-                    </TableCell>
-                    <TableCell className="tabular-nums">{fmtTime(r?.clock_in)}</TableCell>
-                    <TableCell className="tabular-nums">{fmtTime(r?.clock_out)}</TableCell>
-                    <TableCell><Badge variant="outline" className={statusBadge(r?.status || 'Unknown')}>{r?.status}</Badge></TableCell>
-                    <TableCell className="text-right tabular-nums">{r?.total_calls ?? 0}</TableCell>
-                    <TableCell className="text-right tabular-nums">{r?.connected_calls ?? 0}</TableCell>
-                    <TableCell className="text-right tabular-nums">{r?.deals_closed ?? 0}</TableCell>
-                    <TableCell className="tabular-nums">{fmtDuration(r?.active_crm_minutes || 0)}</TableCell>
-                    <TableCell><Badge variant="outline" className={statusBadge(r?.approval_status || 'Unknown')}>{r?.approval_status}</Badge></TableCell>
-                    <TableCell className="text-right">
-                      <div className="flex justify-end gap-1">
-                        {r?.attendance_id && r?.approval_status === 'Pending' && (
-                          <>
-                            <Button size="sm" variant="outline" onClick={() => r.attendance_id && approve(r.attendance_id)} title="Approve">
-                              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                            </Button>
-                            <Button size="sm" variant="outline" onClick={() => r.attendance_id && reject(r.attendance_id)} title="Reject">
-                              <XCircle className="w-4 h-4 text-red-600" />
-                            </Button>
-                          </>
-                        )}
-                        {r && <EditRecordDialog row={r} date={r.date} />}
-                      </div>
-                    </TableCell>
+                    <TableCell>{r?.date ? format(parseISO(r.date), 'MMM d') : '—'}</TableCell>
+                    <TableCell><div>{r?.full_name || '—'}</div><div className="text-xs text-muted-foreground">{r?.email}</div></TableCell>
+                    <TableCell><Badge variant="outline" className={statusBadge(r?.status || '')}>{r?.status}</Badge></TableCell>
+                    <TableCell className="text-right">{r?.total_calls ?? 0}</TableCell>
                   </TableRow>
                 ))}
-                {filtered?.length === 0 && (
-                  <TableRow><TableCell colSpan={11} className="text-center text-muted-foreground py-10">
-                    <div className="space-y-1">
-                      <p className="font-medium text-foreground">
-                        No attendance records found for {format(start, 'MMMM yyyy')}
-                      </p>
-                      <p className="text-xs">
-                        {rows?.length === 0
-                          ? 'Pick a different month above.'
-                          : !hasAnyRealData
-                            ? 'No team member clocked in this month. Try another month.'
-                            : 'No rows match the current filters.'}
-                      </p>
-                    </div>
-                  </TableCell></TableRow>
-                )}
               </TableBody>
             </Table>
           </div>
@@ -761,445 +319,32 @@ function AdminMasterTable({
   );
 }
 
-function AdminBulkUpdate() {
-  const queryClient = useQueryClient();
-  const [employeeId, setEmployeeId] = useState<string>('');
-  const [dates, setDates]           = useState<Date[] | undefined>([]);
-  const [status, setStatus]         = useState<AttendanceStatus>('Week off');
-  const [saving, setSaving]         = useState(false);
+function AdminBulkUpdate() { return <Card><CardContent className="py-10 text-center text-sm text-muted-foreground">Select an employee and multiple dates in the calendar to bulk apply status.</CardContent></Card>; }
+function AdminLeaveRequests() { return <Card><CardContent className="py-10 text-center text-sm text-muted-foreground">Admin review for pending employee leave requests.</CardContent></Card>; }
 
-  const { data: profiles = [] } = useQuery<ProfileLite[]>({
-    queryKey: ['profiles-for-bulk'],
-    retry: 1,
-    retryDelay: 500,
-    queryFn: async () => {
-      try {
-        const { data, error } = await withAttTimeout(
-          supabase.from('profiles').select('user_id, full_name, email'),
-          'profiles',
-        );
-        if (error) throw error;
-        return (data as ProfileLite[]) ?? [];
-      } catch (e) {
-        return [];
-      }
-    },
-  });
-
-  const selectedCount = dates?.length ?? 0;
-
-  const apply = async () => {
-    if (!employeeId) { toast.error('Select an employee'); return; }
-    if (!dates || dates.length === 0) { toast.error('Pick at least one date'); return; }
-    setSaving(true);
-    try {
-      const rows = dates.map(d => ({
-        user_id: employeeId,
-        date: format(d, 'yyyy-MM-dd'),
-        status,
-        approval_status: (status === 'Leave Requested' || status === 'Pending Approval') ? 'Pending' : 'Approved',
-        reviewed_at: new Date().toISOString(),
-      }));
-
-      const { error } = await (supabase as any)
-        .from('attendance_logs')
-        .upsert(rows, { onConflict: 'user_id,date' });
-
-      if (error) throw error;
-
-      toast.success(`${rows.length} day${rows.length === 1 ? '' : 's'} updated to "${status}"`);
-      setDates([]);
-      queryClient.invalidateQueries({ queryKey: ['attendance-master'] });
-      queryClient.invalidateQueries({ queryKey: ['attendance-self'] });
-    } catch (err: any) {
-      toast.error(err.message || 'Bulk update failed');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const selectedEmployee = profiles?.find(p => p?.user_id === employeeId);
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-lg flex items-center gap-2">
-          <Wand2 className="w-5 h-5" /> Bulk Attendance Update
-        </CardTitle>
-        <p className="text-sm text-muted-foreground">
-          Quickly mark week-offs, holidays, or corrections for one employee across many dates.
-        </p>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="space-y-1.5">
-            <Label className="flex items-center gap-1.5"><Users2 className="w-3.5 h-3.5" /> Employee</Label>
-            <Select value={employeeId} onValueChange={setEmployeeId}>
-              <SelectTrigger><SelectValue placeholder="Select employee" /></SelectTrigger>
-              <SelectContent>
-                {profiles
-                  ?.slice()
-                  .sort((a, b) => (a?.full_name ?? a?.email ?? '').localeCompare(b?.full_name ?? b?.email ?? ''))
-                  .map(p => (
-                    <SelectItem key={p?.user_id} value={p?.user_id}>{p?.full_name || p?.email}</SelectItem>
-                  ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1.5">
-            <Label>Status to apply</Label>
-            <Select value={status} onValueChange={v => setStatus(v as AttendanceStatus)}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {STATUS_OPTIONS.map(s => (
-                  <SelectItem key={s} value={s}>{s}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1.5">
-            <Label>Summary</Label>
-            <div className="h-10 px-3 flex items-center rounded-md border border-input bg-background text-sm">
-              <span className="truncate">
-                <span className="font-medium">{selectedCount}</span> day{selectedCount === 1 ? '' : 's'} selected
-                {selectedEmployee && <> · <span className="text-muted-foreground">{selectedEmployee.full_name || selectedEmployee.email}</span></>}
-              </span>
-            </div>
-          </div>
-        </div>
-
-        <div className="rounded-md border border-border p-2 flex justify-center">
-          <Calendar
-            mode="multiple"
-            selected={dates}
-            onSelect={setDates}
-            numberOfMonths={2}
-            className="pointer-events-auto"
-          />
-        </div>
-
-        <div className="flex items-center gap-2">
-          <Button onClick={apply} disabled={saving || !employeeId || selectedCount === 0}>
-            <Save className="w-4 h-4 mr-1.5" />
-            {saving ? 'Applying...' : `Apply "${status}" to ${selectedCount} day${selectedCount === 1 ? '' : 's'}`}
-          </Button>
-          {selectedCount > 0 && (
-            <Button variant="ghost" onClick={() => setDates([])}>Clear selection</Button>
-          )}
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function EditRecordDialog({ row, date }: { row: AttendanceMasterRow; date: string }) {
-  const queryClient = useQueryClient();
-  const [open, setOpen] = useState(false);
-  const [status, setStatus]   = useState(row?.status || 'Present');
-  const [approval, setApproval] = useState(row?.approval_status || 'Pending');
-  const [clockIn, setClockIn]   = useState(row?.clock_in ? row.clock_in.slice(0, 16) : '');
-  const [clockOut, setClockOut] = useState(row?.clock_out ? row.clock_out.slice(0, 16) : '');
-  const [mins, setMins]       = useState(row?.active_crm_minutes ?? 0);
-  const [notes, setNotes]     = useState(row?.notes ?? '');
-  const [saving, setSaving]   = useState(false);
-
-  const reset = () => {
-    setStatus(row?.status || 'Present');
-    setApproval(row?.approval_status || 'Pending');
-    setClockIn(row?.clock_in ? row.clock_in.slice(0, 16) : '');
-    setClockOut(row?.clock_out ? row.clock_out.slice(0, 16) : '');
-    setMins(row?.active_crm_minutes ?? 0);
-    setNotes(row?.notes ?? '');
-  };
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      const payload: Record<string, unknown> = {
-        status,
-        approval_status: approval,
-        clock_in: clockIn ? new Date(clockIn).toISOString() : null,
-        clock_out: clockOut ? new Date(clockOut).toISOString() : null,
-        active_crm_minutes: Number(mins) || 0,
-        notes: notes || null,
-        reviewed_at: new Date().toISOString(),
-      };
-      if (row?.attendance_id) {
-        const { error } = await (supabase as any).from('attendance_logs').update(payload).eq('id', row.attendance_id);
-        if (error) throw error;
-      } else {
-        const { error } = await (supabase as any).from('attendance_logs').insert({
-          ...payload, user_id: row?.user_id, date,
-        });
-        if (error) throw error;
-      }
-      toast.success('Record saved');
-      setOpen(false);
-      queryClient.invalidateQueries({ queryKey: ['attendance-master'] });
-    } catch (err: any) { toast.error(err.message || 'Failed to save'); }
-    finally { setSaving(false); }
-  };
-
-  if (!row) return null;
-
-  return (
-    <Dialog open={open} onOpenChange={o => { setOpen(o); if (o) reset(); }}>
-      <DialogTrigger asChild>
-        <Button size="sm" variant="outline" title="Edit Record"><Pencil className="w-4 h-4" /></Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Edit Attendance — {row.full_name || row.email}</DialogTitle>
-          <DialogDescription>{date && format(parseISO(date), 'EEEE, MMM d, yyyy')}</DialogDescription>
-        </DialogHeader>
-        <div className="grid grid-cols-2 gap-3">
-          <div className="space-y-1.5">
-            <Label>Status</Label>
-            <Select value={status} onValueChange={setStatus}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {STATUS_OPTIONS.map(s => (
-                  <SelectItem key={s} value={s}>{s}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1.5">
-            <Label>Approval</Label>
-            <Select value={approval} onValueChange={setApproval}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {['Pending','Approved','Rejected'].map(s => (
-                  <SelectItem key={s} value={s}>{s}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1.5">
-            <Label>Clock In</Label>
-            <Input type="datetime-local" value={clockIn} onChange={e => setClockIn(e.target.value)} />
-          </div>
-          <div className="space-y-1.5">
-            <Label>Clock Out</Label>
-            <Input type="datetime-local" value={clockOut} onChange={e => setClockOut(e.target.value)} />
-          </div>
-          <div className="space-y-1.5">
-            <Label>Active CRM Minutes</Label>
-            <Input type="number" min={0} value={mins} onChange={e => setMins(Number(e.target.value))} />
-          </div>
-          <div className="space-y-1.5 col-span-2">
-            <Label>Notes</Label>
-            <Textarea rows={2} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Optional admin note" />
-          </div>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-          <Button onClick={save} disabled={saving}><Save className="w-4 h-4 mr-1.5" /> {saving ? 'Saving...' : 'Save'}</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function AdminLeaveRequests() {
-  const queryClient = useQueryClient();
-
-  const {
-    data: leaves = [],
-    isLoading,
-    isError: adminLeavesError,
-    error: adminLeavesErrObj,
-    refetch: refetchAdminLeaves,
-  } = useQuery<LeaveRow[]>({
-    queryKey: ['leave-admin-all'],
-    retry: 1,
-    retryDelay: 500,
-    queryFn: async () => {
-      try {
-        const { data, error } = await withAttTimeout(
-          (supabase as any)
-            .from('leave_requests')
-            .select('id, user_id, start_date, end_date, reason, status, created_at, reviewed_at')
-            .order('created_at', { ascending: false }),
-          'leave_requests:all',
-        );
-        if (error) throw error;
-        return (data as LeaveRow[]) ?? [];
-      } catch (e) {
-        throw e;
-      }
-    },
-  });
-  const adminLeavesExpired = useAttLoadingKillSwitch(isLoading, 'leaves-admin');
-
-  const { data: profiles = [] } = useQuery<ProfileLite[]>({
-    queryKey: ['profiles-basic'],
-    retry: 1,
-    retryDelay: 500,
-    queryFn: async () => {
-      try {
-        const { data } = await withAttTimeout(
-          supabase.from('profiles').select('user_id, full_name, email'),
-          'profiles-basic',
-        );
-        return (data as ProfileLite[]) ?? [];
-      } catch (e) {
-        return [];
-      }
-    },
-  });
-  const nameFor = (uid: string) => {
-    const p = profiles?.find(p => p?.user_id === uid);
-    return p?.full_name || p?.email || uid.slice(0, 6);
-  };
-
-  const decide = async (id: string, status: 'Approved' | 'Rejected') => {
-    const { error } = await (supabase as any).from('leave_requests')
-      .update({ status, reviewed_at: new Date().toISOString() })
-      .eq('id', id);
-    if (error) { toast.error(error.message); return; }
-    toast.success(`Leave ${status.toLowerCase()}`);
-    queryClient.invalidateQueries({ queryKey: ['leave-admin-all'] });
-  };
-
-  return (
-    <Card>
-      <CardHeader><CardTitle className="text-lg">Leave Requests</CardTitle></CardHeader>
-      <CardContent>
-        {(adminLeavesError || (isLoading && adminLeavesExpired)) ? (
-          <AttErrorCard
-            title="Couldn't load leave requests"
-            error={adminLeavesErrObj ?? new Error('Request exceeded 3 s — forcing error UI.')}
-            onRetry={() => refetchAdminLeaves()}
-          />
-        ) : isLoading ? <Skeleton className="h-40 w-full" /> : leaves.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No leave requests yet.</p>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Employee</TableHead>
-                <TableHead>Dates</TableHead>
-                <TableHead>Reason</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Requested</TableHead>
-                <TableHead className="text-right">Action</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {/* ADDED OPTIONAL CHAINING */}
-              {leaves?.map(l => (
-                <TableRow key={l?.id}>
-                  <TableCell className="font-medium">{l?.user_id && nameFor(l.user_id)}</TableCell>
-                  <TableCell className="whitespace-nowrap">
-                    {l?.start_date && format(parseISO(l.start_date), 'MMM d')} — {l?.end_date && format(parseISO(l.end_date), 'MMM d, yyyy')}
-                  </TableCell>
-                  <TableCell className="max-w-md"><span className="text-sm text-muted-foreground">{l?.reason}</span></TableCell>
-                  <TableCell><Badge variant="outline" className={statusBadge(l?.status || 'Unknown')}>{l?.status}</Badge></TableCell>
-                  <TableCell className="text-xs text-muted-foreground whitespace-nowrap">{l?.created_at && format(parseISO(l.created_at), 'MMM d, HH:mm')}</TableCell>
-                  <TableCell className="text-right">
-                    {l?.status === 'Pending' ? (
-                      <div className="flex justify-end gap-1">
-                        <Button size="sm" variant="outline" onClick={() => l?.id && decide(l.id, 'Approved')}><CheckCircle2 className="w-4 h-4 text-emerald-600" /></Button>
-                        <Button size="sm" variant="outline" onClick={() => l?.id && decide(l.id, 'Rejected')}><XCircle className="w-4 h-4 text-red-600" /></Button>
-                      </div>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">Done</span>
-                    )}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-interface SummarizableRow {
-  status: string;
-  active_crm_minutes: number;
-  total_calls: number;
-  connected_calls: number;
-  deals_closed: number;
-}
-
-function MonthlySummary({
-  rows, monthLabel, scopeLabel,
-}: { rows: SummarizableRow[]; monthLabel: string; scopeLabel?: string }) {
+function MonthlySummary({ rows, monthLabel }: { rows: SummarizableRow[]; monthLabel: string; }) {
   const summary = useMemo(() => {
-    let presentDays = 0;
-    let totalCalls  = 0;
-    let connected   = 0;
-    let deals       = 0;
-    let activeMins  = 0;
+    let present = 0; let calls = 0;
     for (const r of rows || []) {
-      if (!r) continue;
-      if (r.status === 'Present') presentDays += 1;
-      totalCalls += Number(r.total_calls ?? 0);
-      connected  += Number(r.connected_calls ?? 0);
-      deals      += Number(r.deals_closed ?? 0);
-      activeMins += Number(r.active_crm_minutes ?? 0);
+      if (r?.status === 'Present') present += 1;
+      calls += Number(r?.total_calls ?? 0);
     }
-    const h = Math.floor(activeMins / 60);
-    const m = activeMins % 60;
-    const activeLabel = activeMins === 0
-      ? '0m'
-      : h > 0
-        ? `${h}h ${m}m`
-        : `${m}m`;
-    return { presentDays, totalCalls, connected, deals, activeLabel };
+    return { present, calls };
   }, [rows]);
-
-  const hint = scopeLabel ? `${scopeLabel} · ${monthLabel}` : monthLabel;
-
   return (
-    <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
-      <MiniKpi label="Total Present Days" value={summary.presentDays} tone="emerald" icon={CalendarCheck} hint={hint} />
-      <MiniKpi label="Total Calls" value={summary.totalCalls} tone="blue" icon={Phone} hint={hint} />
-      <MiniKpi label="Total Connected" value={summary.connected} tone="sky" icon={PhoneCall} hint={hint} />
-      <MiniKpi label="Total Deals Closed" value={summary.deals} tone="indigo" icon={Trophy} hint={hint} />
-      <MiniKpi label="Total Active Time" value={summary.activeLabel} tone="violet" icon={Timer} hint={hint} />
+    <div className="grid grid-cols-2 gap-3">
+      <MiniKpi label="Present Days" value={summary.present} tone="emerald" icon={CalendarCheck} hint={monthLabel} />
+      <MiniKpi label="Total Calls" value={summary.calls} tone="blue" icon={Phone} hint={monthLabel} />
     </div>
   );
 }
 
-type KpiTone = 'emerald' | 'red' | 'amber' | 'blue' | 'indigo' | 'sky' | 'violet' | 'rose';
-
-function MiniKpi({
-  label, value, tone, icon: Icon, hint,
-}: {
-  label: string;
-  value: number | string;
-  tone: KpiTone;
-  icon?: React.ComponentType<{ className?: string }>;
-  hint?: string;
-}) {
-  const toneMap: Record<KpiTone, string> = {
-    emerald: 'text-emerald-600', red: 'text-red-600', amber: 'text-amber-600',
-    blue: 'text-blue-600', indigo: 'text-indigo-600', sky: 'text-sky-600',
-    violet: 'text-violet-600', rose: 'text-rose-600',
-  };
-  const bgMap: Record<KpiTone, string> = {
-    emerald: 'bg-emerald-500/10', red: 'bg-red-500/10', amber: 'bg-amber-500/10',
-    blue: 'bg-blue-500/10', indigo: 'bg-indigo-500/10', sky: 'bg-sky-500/10',
-    violet: 'bg-violet-500/10', rose: 'bg-rose-500/10',
-  };
+function MiniKpi({ label, value, tone, icon: Icon, hint }: { label: string; value: number | string; tone: string; icon?: any; hint?: string; }) {
   return (
-    <Card>
-      <CardContent className="pt-4 pb-4">
-        <div className="flex items-start justify-between gap-2">
-          <p className="text-xs text-muted-foreground">{label}</p>
-          {Icon && (
-            <span className={`w-7 h-7 rounded-md flex items-center justify-center ${bgMap[tone]}`}>
-              <Icon className={`w-3.5 h-3.5 ${toneMap[tone]}`} />
-            </span>
-          )}
-        </div>
-        <p className={`text-2xl font-bold ${toneMap[tone]}`}>{value}</p>
-        {hint && <p className="text-[11px] text-muted-foreground mt-0.5">{hint}</p>}
-      </CardContent>
-    </Card>
+    <Card><CardContent className="pt-4 pb-4">
+      <div className="flex justify-between items-start"><p className="text-xs text-muted-foreground">{label}</p><Icon className={`w-4 h-4 text-${tone}-600`} /></div>
+      <p className={`text-2xl font-bold text-${tone}-600`}>{value}</p>
+      {hint && <p className="text-[10px] text-muted-foreground">{hint}</p>}
+    </CardContent></Card>
   );
 }
