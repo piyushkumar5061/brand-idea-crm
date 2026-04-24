@@ -4,37 +4,71 @@ import { Link, useLocation } from 'react-router-dom';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import {
-  LayoutDashboard, Users, Phone, BarChart3, Upload, UserPlus, LogOut, Menu, X, GraduationCap, Clock, Settings,
+  LayoutDashboard, Users, Phone, BarChart3, Upload, UserPlus, LogOut, Menu, X,
+  Sparkles, Clock, Settings, Megaphone, MailCheck, Briefcase, Target,
+  MapPin, FileText, Shield,
 } from 'lucide-react';
 import ClockInOutButton from '@/components/ClockInOutButton';
 
+// ---------------------------------------------------------------------------
+// Sidebar link definitions
+// ---------------------------------------------------------------------------
+// Admins (super_admin / admin / manager) see BOTH the digital-marketing agency
+// modules AND the full CRM module set. Grouped for readability.
 const adminLinks = [
-  { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
-  { to: '/leads', icon: Users, label: 'Leads' },
-  { to: '/call-logs', icon: Phone, label: 'Call Logs' },
-  { to: '/reports', icon: BarChart3, label: 'Reports' },
-  { to: '/attendance', icon: Clock, label: 'Attendance' },
-  { to: '/upload', icon: Upload, label: 'CSV Upload' },
-  { to: '/team', icon: UserPlus, label: 'Team' },
-  { to: '/settings', icon: Settings, label: 'Settings' },
+  // — Core —
+  { to: '/dashboard',       icon: LayoutDashboard, label: 'Dashboard' },
+
+  // — CRM —
+  { to: '/leads',           icon: Users,           label: 'Leads' },
+  { to: '/call-logs',       icon: Phone,           label: 'Call Logs' },
+  { to: '/attendance',      icon: Clock,           label: 'Attendance' },
+  { to: '/upload',          icon: Upload,          label: 'CSV Upload' },
+
+  // — Agency modules —
+  { to: '/marketing',       icon: Megaphone,       label: 'Marketing' },
+  { to: '/email-validator', icon: MailCheck,       label: 'Email Validator' },
+  { to: '/projects',        icon: Briefcase,       label: 'Projects' },
+  { to: '/lead-scraper',    icon: Target,          label: 'Lead Scraper' },
+  { to: '/field-visits',    icon: MapPin,          label: 'Field Visits' },
+  { to: '/invoices',        icon: FileText,        label: 'Invoices' },
+
+  // — Admin —
+  { to: '/reports',         icon: BarChart3,       label: 'Reports' },
+  { to: '/team',            icon: UserPlus,        label: 'Team' },
+  { to: '/access-control',  icon: Shield,          label: 'Access Control' },
+  { to: '/settings',        icon: Settings,        label: 'Settings' },
 ];
 
 const employeeLinks = [
-  { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
-  { to: '/leads', icon: Users, label: 'My Leads' },
-  { to: '/call-logs', icon: Phone, label: 'Call Logs' },
-  { to: '/attendance', icon: Clock, label: 'My Attendance' },
-  { to: '/settings', icon: Settings, label: 'Settings' },
+  { to: '/dashboard',   icon: LayoutDashboard, label: 'Dashboard' },
+  { to: '/leads',       icon: Users,           label: 'My Leads' },
+  { to: '/call-logs',   icon: Phone,           label: 'Call Logs' },
+  { to: '/field-visits',icon: MapPin,          label: 'Field Visits' },
+  { to: '/attendance',  icon: Clock,           label: 'My Attendance' },
+  { to: '/settings',    icon: Settings,        label: 'Settings' },
 ];
+
+// ---------------------------------------------------------------------------
+// Role badge resolver — 100 % DB-driven. Whatever role useAuth reports is
+// what we show. No email overrides.
+// ---------------------------------------------------------------------------
+function resolveRoleLabel(role: string | null): string {
+  if (!role) return 'Member';
+  return role.replace(/_/g, ' ');
+}
 
 export default function AppLayout({ children }: { children: ReactNode }) {
   const { user, role, signOut, isAdminOrAbove } = useAuth();
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
 
-  // BULLETPROOF FIX: Forces your specific email to always get Admin links, 
-  // even if the database auth state is temporarily confused.
-  const links = (isAdminOrAbove || role === 'admin' || user?.email === 'piyushkumar5061@gmail.com') ? adminLinks : employeeLinks;
+  // Admin sidebar whenever the DB role is admin-tier. useAuth.isAdminOrAbove
+  // already encapsulates this; the redundant role checks were legacy.
+  const isAdmin = isAdminOrAbove;
+
+  const links = isAdmin ? adminLinks : employeeLinks;
+  const roleLabel = resolveRoleLabel(role);
 
   return (
     <div className="min-h-screen flex">
@@ -42,14 +76,14 @@ export default function AppLayout({ children }: { children: ReactNode }) {
       <aside className="hidden md:flex w-64 flex-col bg-sidebar text-sidebar-foreground border-r border-sidebar-border">
         <div className="p-4 border-b border-sidebar-border flex items-center gap-3">
           <div className="w-8 h-8 bg-sidebar-primary rounded-lg flex items-center justify-center">
-            <GraduationCap className="w-4 h-4 text-sidebar-primary-foreground" />
+            <Sparkles className="w-4 h-4 text-sidebar-primary-foreground" />
           </div>
           <div>
-            <h1 className="font-bold text-sm text-sidebar-primary-foreground">Brand Idea CRM</h1>
-            <p className="text-xs text-sidebar-foreground/60 capitalize">{role?.replace('_', ' ') || 'Admin'}</p>
+            <h1 className="font-bold text-sm text-sidebar-primary-foreground">Brand Idea</h1>
+            <p className="text-xs text-sidebar-foreground/60 capitalize">{roleLabel}</p>
           </div>
         </div>
-        <nav className="flex-1 p-3 space-y-1">
+        <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
           {links.map(link => (
             <Link
               key={link.to}
@@ -61,8 +95,8 @@ export default function AppLayout({ children }: { children: ReactNode }) {
                   : 'text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground'
               )}
             >
-              <link.icon className="w-4 h-4" />
-              {link.label}
+              <link.icon className="w-4 h-4 shrink-0" />
+              <span className="truncate">{link.label}</span>
             </Link>
           ))}
         </nav>
@@ -78,8 +112,8 @@ export default function AppLayout({ children }: { children: ReactNode }) {
       {/* Mobile header */}
       <div className="md:hidden fixed top-0 left-0 right-0 z-50 bg-sidebar text-sidebar-foreground border-b border-sidebar-border px-4 py-3 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <GraduationCap className="w-5 h-5 text-sidebar-primary" />
-          <span className="font-bold text-sm">Brand Idea CRM</span>
+          <Sparkles className="w-5 h-5 text-sidebar-primary" />
+          <span className="font-bold text-sm">Brand Idea</span>
         </div>
         <button onClick={() => setMobileOpen(!mobileOpen)}>
           {mobileOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
@@ -88,7 +122,7 @@ export default function AppLayout({ children }: { children: ReactNode }) {
 
       {/* Mobile menu */}
       {mobileOpen && (
-        <div className="md:hidden fixed inset-0 z-40 bg-sidebar text-sidebar-foreground pt-14">
+        <div className="md:hidden fixed inset-0 z-40 bg-sidebar text-sidebar-foreground pt-14 overflow-y-auto">
           <nav className="p-4 space-y-1">
             {links.map(link => (
               <Link

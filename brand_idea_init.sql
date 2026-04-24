@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   email       TEXT,
   phone       TEXT,
   role        TEXT DEFAULT 'employee',
+  -- status gates CRM access: 'pending' (default) → awaiting admin approval;
+  -- 'approved' → full access; 'suspended' → blocked.
+  -- The founder email is auto-approved by the handle_new_user trigger.
+  status      TEXT NOT NULL DEFAULT 'pending',
   created_at  TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
   updated_at  TIMESTAMPTZ DEFAULT now()
 );
@@ -58,6 +62,10 @@ CREATE TABLE IF NOT EXISTS public.profiles (
 ALTER TABLE public.profiles DROP CONSTRAINT IF EXISTS profiles_role_check;
 ALTER TABLE public.profiles ADD CONSTRAINT profiles_role_check
   CHECK (role IN ('super_admin','admin','manager','employee'));
+
+ALTER TABLE public.profiles DROP CONSTRAINT IF EXISTS profiles_status_check;
+ALTER TABLE public.profiles ADD CONSTRAINT profiles_status_check
+  CHECK (status IN ('pending','approved','suspended'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS profiles_user_id_unique ON public.profiles(user_id);
 
@@ -267,18 +275,29 @@ RETURNS TRIGGER
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
 AS $$
 DECLARE
-  -- Change this to the email that should be auto-granted super_admin role.
-  SUPER_ADMIN_EMAIL CONSTANT TEXT := 'piyushkumar5061@gmail.com';
+  -- Change this constant to the email that should be auto-granted super_admin.
+  SUPER_ADMIN_EMAIL CONSTANT TEXT    := 'piyushkumar5061@gmail.com';
+  v_is_founder               BOOLEAN := (NEW.email = SUPER_ADMIN_EMAIL);
 BEGIN
-  INSERT INTO public.profiles (id, user_id, full_name, email, role)
+  -- Insert a fresh profile row.
+  -- Founder → super_admin + approved immediately (no deadlock).
+  -- Everyone else → employee + pending (admin must approve before they can log in).
+  INSERT INTO public.profiles (id, user_id, full_name, email, role, status)
   VALUES (
     gen_random_uuid(),
     NEW.id,
     COALESCE(NEW.raw_user_meta_data->>'full_name', split_part(NEW.email, '@', 1)),
     NEW.email,
-    CASE WHEN NEW.email = SUPER_ADMIN_EMAIL THEN 'super_admin' ELSE 'employee' END
+    CASE WHEN v_is_founder THEN 'super_admin' ELSE 'employee' END,
+    CASE WHEN v_is_founder THEN 'approved'    ELSE 'pending'  END
   )
-  ON CONFLICT (user_id) DO NOTHING;
+  -- On re-trigger (e.g. email re-confirm), refresh role/status so the
+  -- founder always re-gets super_admin even if the row was corrupted.
+  ON CONFLICT (user_id) DO UPDATE
+    SET
+      role   = EXCLUDED.role,
+      status = EXCLUDED.status,
+      email  = EXCLUDED.email;
   RETURN NEW;
 END;
 $$;
@@ -637,17 +656,25 @@ GRANT EXECUTE ON FUNCTION public.employee_attendance_history(UUID, DATE, DATE) T
 
 -- ============================================================================
 -- 14. Backfill profile rows for any auth.users that pre-date the trigger
+--     Also fixes the status column for any rows that were created before
+--     the status column was added (they got the DEFAULT 'pending').
 -- ============================================================================
-INSERT INTO public.profiles (id, user_id, full_name, email, role)
+INSERT INTO public.profiles (id, user_id, full_name, email, role, status)
 SELECT
   gen_random_uuid(),
   u.id,
   COALESCE(u.raw_user_meta_data->>'full_name', split_part(u.email, '@', 1)),
   u.email,
-  CASE WHEN u.email = 'piyushkumar5061@gmail.com' THEN 'super_admin' ELSE 'employee' END
+  CASE WHEN u.email = 'piyushkumar5061@gmail.com' THEN 'super_admin' ELSE 'employee' END,
+  CASE WHEN u.email = 'piyushkumar5061@gmail.com' THEN 'approved'    ELSE 'pending'  END
 FROM auth.users u
 LEFT JOIN public.profiles p ON p.user_id = u.id
 WHERE p.user_id IS NULL;
+
+-- Ensure the founder row is always correct even if it already existed
+UPDATE public.profiles
+SET role = 'super_admin', status = 'approved'
+WHERE email = 'piyushkumar5061@gmail.com';
 
 -- ============================================================================
 -- 15. Reload PostgREST schema cache

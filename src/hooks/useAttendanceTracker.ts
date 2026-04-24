@@ -8,8 +8,6 @@ import { format } from 'date-fns';
 const IDLE_THRESHOLD_MS = 15 * 60 * 1000;
 // How often we evaluate idleness + push an update to the DB (1 min).
 const TICK_INTERVAL_MS  = 60 * 1000;
-// How often we persist the running counter back to attendance_logs.
-// Pushing every tick is fine (single row update).
 
 export interface AttendanceTodayRow {
   id: string;
@@ -33,13 +31,11 @@ interface UseAttendanceTrackerResult {
 }
 
 /**
- * Global-ish attendance tracker used by the sidebar button and the Attendance page.
+ * Global attendance tracker used by the sidebar button and the Attendance page.
  * - On mount: fetches today's attendance row for the signed-in user.
  * - While clocked in: every minute, if the user was active within the last
- *   15 minutes (mousemove / keydown / click), increment active_crm_minutes and
- *   persist to the DB.
- * - clockOut stamps clock_out, flips approval_status to 'Pending' for admin
- *   review, and stops the tracker.
+ * 15 minutes, increment active_crm_minutes and persist to the DB.
+ * - clockOut stamps clock_out and flips approval_status to 'Pending'.
  */
 export function useAttendanceTracker(): UseAttendanceTrackerResult {
   const { user } = useAuth();
@@ -47,7 +43,6 @@ export function useAttendanceTracker(): UseAttendanceTrackerResult {
   const [loading, setLoading]           = useState(true);
   const [activeMinutes, setActiveMinutes] = useState(0);
 
-  // Refs so the interval callback sees the latest values without re-arming.
   const lastActivityAt = useRef<number>(Date.now());
   const minutesRef     = useRef<number>(0);
   const rowIdRef       = useRef<string | null>(null);
@@ -58,32 +53,54 @@ export function useAttendanceTracker(): UseAttendanceTrackerResult {
   const refresh = useCallback(async () => {
     if (!user) { setLoading(false); return; }
     setLoading(true);
-    const { data } = await (supabase as any)
-      .from('attendance_logs')
-      .select('id, user_id, date, clock_in, clock_out, status, approval_status, active_crm_minutes')
-      .eq('user_id', user.id)
-      .eq('date', today_iso)
-      .maybeSingle();
-    if (data) {
-      setToday(data as AttendanceTodayRow);
-      rowIdRef.current     = data.id;
-      minutesRef.current   = data.active_crm_minutes ?? 0;
-      setActiveMinutes(minutesRef.current);
-      clockedInRef.current = !!data.clock_in && !data.clock_out;
-    } else {
+    
+    const REFRESH_TIMEOUT_MS = 3000;
+    const guarded = new Promise<{ data: unknown | null; error: unknown }>((resolve) => {
+      const t = setTimeout(() => {
+        resolve({ data: null, error: new Error('attendance_logs fetch timed out') });
+      }, REFRESH_TIMEOUT_MS);
+      (supabase as any)
+        .from('attendance_logs')
+        .select('id, user_id, date, clock_in, clock_out, status, approval_status, active_crm_minutes')
+        .eq('user_id', user.id)
+        .eq('date', today_iso)
+        .maybeSingle()
+        .then((res: { data: unknown | null; error: unknown }) => {
+          clearTimeout(t);
+          resolve(res);
+        }, (err: unknown) => {
+          clearTimeout(t);
+          resolve({ data: null, error: err });
+        });
+    });
+
+    try {
+      const { data, error } = await guarded;
+      if (data) {
+        const row = data as AttendanceTodayRow;
+        setToday(row);
+        rowIdRef.current     = row.id;
+        minutesRef.current   = row.active_crm_minutes ?? 0;
+        setActiveMinutes(minutesRef.current);
+        clockedInRef.current = !!row.clock_in && !row.clock_out;
+      } else {
+        setToday(null);
+        rowIdRef.current     = null;
+        minutesRef.current   = 0;
+        setActiveMinutes(0);
+        clockedInRef.current = false;
+      }
+    } catch (e) {
       setToday(null);
       rowIdRef.current     = null;
-      minutesRef.current   = 0;
-      setActiveMinutes(0);
       clockedInRef.current = false;
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }, [user, today_iso]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  // Listen for any user activity. We only need a timestamp update; we don't
-  // tick minutes here — the interval does that on a fixed cadence.
   useEffect(() => {
     const bump = () => { lastActivityAt.current = Date.now(); };
     window.addEventListener('mousemove', bump);
@@ -98,15 +115,13 @@ export function useAttendanceTracker(): UseAttendanceTrackerResult {
     };
   }, []);
 
-  // Minute-by-minute tick: if clocked in and not idle, increment + persist.
   useEffect(() => {
     const id = window.setInterval(async () => {
       if (!clockedInRef.current || !rowIdRef.current) return;
       const idle = Date.now() - lastActivityAt.current > IDLE_THRESHOLD_MS;
-      if (idle) return; // idle window — don't bill this minute
+      if (idle) return;
       minutesRef.current += 1;
       setActiveMinutes(minutesRef.current);
-      // Fire-and-forget update (RLS only permits today + self, which matches).
       await (supabase as any)
         .from('attendance_logs')
         .update({ active_crm_minutes: minutesRef.current })
@@ -118,7 +133,6 @@ export function useAttendanceTracker(): UseAttendanceTrackerResult {
   const clockIn = useCallback(async () => {
     if (!user) return;
     const nowIso = new Date().toISOString();
-    // upsert pattern: try insert, if it exists (unique user_id+date) update it.
     const { data: existing } = await (supabase as any)
       .from('attendance_logs')
       .select('id, clock_in')
@@ -127,7 +141,6 @@ export function useAttendanceTracker(): UseAttendanceTrackerResult {
       .maybeSingle();
 
     if (existing) {
-      // Re-opening: clear clock_out, keep minutes.
       const { data, error } = await (supabase as any)
         .from('attendance_logs')
         .update({ clock_in: existing.clock_in ?? nowIso, clock_out: null, status: 'Present', approval_status: 'Pending' })
@@ -166,22 +179,28 @@ export function useAttendanceTracker(): UseAttendanceTrackerResult {
   }, [user, today_iso]);
 
   const clockOut = useCallback(async () => {
-    if (!rowIdRef.current) return;
+    if (!rowIdRef.current) {
+      await refresh(); 
+      return; 
+    }
+
     const nowIso = new Date().toISOString();
     const { data, error } = await (supabase as any)
       .from('attendance_logs')
       .update({
         clock_out: nowIso,
         active_crm_minutes: minutesRef.current,
-        approval_status: 'Pending', // admin reviews clock-outs
+        approval_status: 'Pending',
       })
-      .eq('id', rowIdRef.current)
+      .eq('id', rowIdRef.current) 
       .select('id, user_id, date, clock_in, clock_out, status, approval_status, active_crm_minutes')
       .single();
+      
     if (error) throw error;
+    
     setToday(data as AttendanceTodayRow);
     clockedInRef.current = false;
-  }, []);
+  }, [refresh]);
 
   const isClockedIn = !!today?.clock_in && !today?.clock_out;
 
