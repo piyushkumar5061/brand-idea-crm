@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -7,13 +7,24 @@ import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Badge } from '@/components/ui/badge';
 import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from 'sonner';
-import { UserPlus, LogOut, KeyRound, Trash2, Sparkles, CheckCircle2, XCircle, Clock, ShieldAlert } from 'lucide-react';
+import { 
+  UserPlus, Shield, Settings2, Trash2, ShieldAlert, 
+  Search, CheckCircle2, XCircle, LogOut, KeyRound, Sparkles, Clock 
+} from 'lucide-react';
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog';
+import {
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
+} from '@/components/ui/table';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger,
 } from '@/components/ui/alert-dialog';
 
+// --- Types ---
 type ProfileStatus = 'pending' | 'approved' | 'suspended';
 
 interface TeamMember {
@@ -22,40 +33,66 @@ interface TeamMember {
   email: string | null;
   role: string;
   status: ProfileStatus;
+  designation: string | null;
+  modules: string[];
 }
 
+const MODULE_OPTIONS = [
+  { id: 'attendance', label: 'Attendance' },
+  { id: 'leave', label: 'Leave Management' },
+  { id: 'crm', label: 'CRM' },
+  { id: 'crm_leads', label: 'CRM Leads' },
+  { id: 'marketing', label: 'Marketing' },
+  { id: 'projects', label: 'Projects' },
+  { id: 'lead_scraper', label: 'Lead Scraper' },
+  { id: 'field_visits', label: 'Field Visits' },
+  { id: 'reports', label: 'Reports' },
+];
+
 export default function Team() {
-  const { isAdminOrAbove, user } = useAuth();
-  const canManage = isAdminOrAbove;
+  const { user, isAdminOrAbove } = useAuth();
   const [members, setMembers] = useState<TeamMember[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+
+  // --- Modal & Form States ---
+  const [isManageModalOpen, setIsManageModalOpen] = useState(false);
+  const [selectedMember, setSelectedMember] = useState<TeamMember | null>(null);
+  const [tempRole, setTempRole] = useState('employee');
+  const [tempDesignation, setTempDesignation] = useState('');
+  const [tempModules, setTempModules] = useState<string[]>([]);
+  
   const [newEmail, setNewEmail] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [newName, setNewName] = useState('');
   const [newPhone, setNewPhone] = useState('');
   const [newRole, setNewRole] = useState('employee');
-  const [creating, setCreating] = useState(false);
+  
+  const [isSaving, setIsSaving] = useState(false);
   const [resetPasswordId, setResetPasswordId] = useState<string | null>(null);
   const [resetPassword, setResetPassword] = useState('');
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
-  // ── Data fetching ──────────────────────────────────────────────────────────
-
+  // --- Data Fetching ---
   const fetchTeam = async () => {
-    const { data } = await (supabase
-      .from('profiles') as any)
-      .select('user_id, full_name, email, role, status')
-      .order('status', { ascending: true })   // pending first
+    setLoading(true);
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('user_id, full_name, email, role, status, designation, modules')
+      .order('status', { ascending: true }) // pending first
       .order('full_name', { ascending: true });
 
-    if (data) {
+    if (error) {
+      toast.error("Failed to load team: " + error.message);
+    } else {
       setMembers(data as TeamMember[]);
     }
+    setLoading(false);
   };
 
   useEffect(() => { fetchTeam(); }, []);
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
-
+  // --- Action Handlers ---
   const generatePassword = () => {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%&';
     const arr = crypto.getRandomValues(new Uint32Array(14));
@@ -64,170 +101,97 @@ export default function Team() {
     toast.success('Secure password generated');
   };
 
-  const fireOnboardingWebhook = async (payload: {
-    email: string; phone: string; full_name: string; password: string; role: string;
-  }) => {
-    const url = (import.meta.env.VITE_N8N_ONBOARDING_WEBHOOK as string | undefined)
-      || 'https://n8n.example.com/webhook/onboard-employee';
-    if (!url || url.includes('example.com')) {
-      console.warn('[onboarding webhook] VITE_N8N_ONBOARDING_WEBHOOK not set; skipping POST', payload);
-      return;
-    }
-    try {
-      await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    } catch (err) {
-      console.error('[onboarding webhook] failed', err);
-    }
-  };
-
-  // ── CRUD actions ──────────────────────────────────────────────────────────
-
   const createUser = async () => {
     if (!newEmail || !newPassword || !newName) { toast.error('Fill all fields'); return; }
-    if (newPassword.length < 6) { toast.error('Password must be at least 6 characters'); return; }
-    setCreating(true);
+    setActionLoading('creating');
     try {
       const { data, error } = await supabase.functions.invoke('create-user', {
         body: {
-          email: newEmail,
-          password: newPassword,
-          full_name: newName,
-          phone: newPhone || undefined,
-          role: newRole,
-          // Admin-created accounts skip pending — they're explicitly invited
-          status: 'approved',
+          email: newEmail, password: newPassword, full_name: newName,
+          phone: newPhone || undefined, role: newRole, status: 'approved',
         },
       });
-      if (error) throw error;
-      if (data?.error) throw new Error(data.error);
+      if (error || data?.error) throw error || new Error(data.error);
 
-      await fireOnboardingWebhook({ email: newEmail, phone: newPhone, full_name: newName, password: newPassword, role: newRole });
-
-      toast.success(`Account created for ${newEmail} — credentials dispatched`);
-      setNewEmail(''); setNewPassword(''); setNewName(''); setNewPhone(''); setNewRole('employee');
+      toast.success(`Account created for ${newEmail}`);
+      setNewEmail(''); setNewPassword(''); setNewName(''); setNewPhone('');
       fetchTeam();
     } catch (err: any) {
       toast.error(err.message || 'Failed to create user');
-    } finally { setCreating(false); }
+    } finally { setActionLoading(null); }
   };
 
-  const manageUser = async (action: string, userId: string, extra?: Record<string, string>) => {
-    setActionLoading(`${action}-${userId}`);
-    try {
-      const { data, error } = await supabase.functions.invoke('manage-user', {
-        body: { action, user_id: userId, ...extra },
-      });
-      if (error) throw error;
-      if (data?.error) throw new Error(data.error);
-      toast.success(data.message || 'Done');
-      if (action === 'delete') fetchTeam();
-    } catch (err: any) {
-      toast.error(err.message || 'Action failed');
-    } finally {
-      setActionLoading(null);
-      setResetPasswordId(null);
-      setResetPassword('');
-    }
+  const openManagementModal = (member: TeamMember) => {
+    setSelectedMember(member);
+    setTempRole(member.role);
+    setTempDesignation(member.designation || '');
+    setTempModules(member.modules || []);
+    setIsManageModalOpen(true);
   };
 
-  const changeRole = async (userId: string, role: string) => {
-    const { error } = await (supabase.from('profiles') as any).update({ role }).eq('user_id', userId);
-    if (error) { toast.error(error.message); return; }
-    toast.success('Role updated');
-    fetchTeam();
-  };
+  const handleSaveModules = async () => {
+    if (!selectedMember) return;
+    setIsSaving(true);
+    
+    const { error } = await supabase
+      .from('profiles')
+      .update({ 
+        role: tempRole,
+        designation: tempDesignation,
+        modules: tempModules 
+      })
+      .eq('user_id', selectedMember.user_id);
 
-  /**
-   * Approve or suspend a user directly on their profiles row.
-   * Uses the profiles_update_admin RLS policy (admin or above can update any row).
-   */
-  const setUserStatus = async (userId: string, status: ProfileStatus, displayName: string) => {
-    setActionLoading(`status-${userId}`);
-    try {
-      const { error } = await (supabase.from('profiles') as any)
-        .update({ status })
-        .eq('user_id', userId);
-      if (error) throw error;
-
-      const label = status === 'approved' ? 'approved' : status === 'suspended' ? 'suspended' : 'set to pending';
-      toast.success(`${displayName || 'User'} ${label}`);
+    if (error) {
+      toast.error("Failed to save: " + error.message);
+    } else {
+      toast.success("Permissions updated");
+      setIsManageModalOpen(false);
       fetchTeam();
-    } catch (err: any) {
-      toast.error(err.message || 'Failed to update status');
-    } finally {
-      setActionLoading(null);
     }
+    setIsSaving(false);
   };
 
-  // ── Display helpers ────────────────────────────────────────────────────────
-
-  const roleBadgeColor = (role: string) => {
-    if (role === 'super_admin') return 'bg-destructive/10 text-destructive';
-    if (role === 'admin')       return 'bg-primary/10 text-primary';
-    if (role === 'manager')     return 'bg-accent/10 text-accent';
-    return 'bg-muted text-muted-foreground';
+  const toggleModule = (moduleId: string) => {
+    setTempModules(prev => 
+      prev.includes(moduleId) ? prev.filter(m => m !== moduleId) : [...prev, moduleId]
+    );
   };
 
-  const statusBadge = (s: ProfileStatus) => {
-    if (s === 'approved')  return { label: 'Approved',  className: 'bg-emerald-500/10 text-emerald-600 border-emerald-500/30' };
-    if (s === 'suspended') return { label: 'Suspended', className: 'bg-destructive/10 text-destructive border-destructive/30' };
-    return                        { label: 'Pending',   className: 'bg-amber-500/10 text-amber-600 border-amber-500/30' };
+  const setUserStatus = async (userId: string, status: ProfileStatus) => {
+    setActionLoading(`status-${userId}`);
+    const { error } = await supabase.from('profiles').update({ status }).eq('user_id', userId);
+    if (error) toast.error(error.message);
+    else { toast.success(`Status updated`); fetchTeam(); }
+    setActionLoading(null);
   };
 
-  const pendingMembers  = members.filter(m => m.status === 'pending');
-  const activeMembers   = members.filter(m => m.status !== 'pending');
+  const filteredMembers = useMemo(() => members.filter(m => 
+    m.full_name?.toLowerCase().includes(search.toLowerCase()) || 
+    m.email?.toLowerCase().includes(search.toLowerCase())
+  ), [members, search]);
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  const pendingMembers = members.filter(m => m.status === 'pending');
 
   return (
-    <div>
-      <h1 className="text-2xl font-bold mb-6">Team Management</h1>
+    <div className="space-y-6">
+      <h1 className="text-2xl font-bold">Team Management</h1>
 
-      {/* ── Pending Approval Section ──────────────────────────────────────── */}
-      {canManage && pendingMembers.length > 0 && (
-        <Card className="mb-6 border-amber-500/30 bg-amber-500/5">
+      {/* --- Pending Approval Banner --- */}
+      {isAdminOrAbove && pendingMembers.length > 0 && (
+        <Card className="border-amber-500/30 bg-amber-500/5">
           <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2 text-amber-700 dark:text-amber-400">
-              <Clock className="w-4 h-4" />
-              Pending Approval
-              <Badge variant="outline" className="bg-amber-500/10 text-amber-600 border-amber-500/30 ml-1">
-                {pendingMembers.length}
-              </Badge>
+            <CardTitle className="text-base flex items-center gap-2 text-amber-600">
+              <Clock className="w-4 h-4" /> Pending Approval ({pendingMembers.length})
             </CardTitle>
-            <p className="text-xs text-muted-foreground">
-              These users have signed up but cannot access the CRM until you approve them.
-            </p>
           </CardHeader>
           <CardContent className="space-y-2">
             {pendingMembers.map(m => (
-              <div
-                key={m.user_id}
-                className="flex flex-col sm:flex-row sm:items-center gap-3 justify-between p-3 bg-background rounded-lg border"
-              >
-                <div>
-                  <span className="font-medium text-sm">{m.full_name || 'No name'}</span>
-                  <span className="text-xs text-muted-foreground ml-2">{m.email}</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    size="sm"
-                    className="bg-emerald-600 hover:bg-emerald-700 text-white gap-1.5"
-                    disabled={actionLoading === `status-${m.user_id}`}
-                    onClick={() => setUserStatus(m.user_id, 'approved', m.full_name || m.email || 'User')}
-                  >
-                    <CheckCircle2 className="w-3.5 h-3.5" />
-                    Approve
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="text-destructive border-destructive/30 hover:bg-destructive/10 gap-1.5"
-                    disabled={actionLoading === `status-${m.user_id}`}
-                    onClick={() => setUserStatus(m.user_id, 'suspended', m.full_name || m.email || 'User')}
-                  >
-                    <XCircle className="w-3.5 h-3.5" />
-                    Reject
-                  </Button>
+              <div key={m.user_id} className="flex items-center justify-between p-3 bg-background rounded-lg border">
+                <span className="text-sm font-medium">{m.full_name || m.email}</span>
+                <div className="flex gap-2">
+                  <Button size="sm" className="bg-emerald-600" onClick={() => setUserStatus(m.user_id, 'approved')}>Approve</Button>
+                  <Button size="sm" variant="outline" className="text-destructive" onClick={() => setUserStatus(m.user_id, 'suspended')}>Reject</Button>
                 </div>
               </div>
             ))}
@@ -235,195 +199,108 @@ export default function Team() {
         </Card>
       )}
 
-      {/* ── Create New Account ────────────────────────────────────────────── */}
-      {canManage && (
-        <Card className="mb-6">
-          <CardHeader>
-            <CardTitle className="text-lg flex items-center gap-2">
-              <UserPlus className="w-5 h-5" /> Create Employee Account
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className="space-y-1.5">
-                <Label htmlFor="name">Full Name</Label>
-                <Input id="name" placeholder="John Doe" value={newName} onChange={e => setNewName(e.target.value)} />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="email">Email</Label>
-                <Input id="email" type="email" placeholder="john@example.com" value={newEmail} onChange={e => setNewEmail(e.target.value)} />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="phone">Phone (with country code)</Label>
-                <Input id="phone" type="tel" placeholder="+91 98765 43210" value={newPhone} onChange={e => setNewPhone(e.target.value)} />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="password">Password</Label>
-                <div className="flex gap-2">
-                  <Input id="password" type="text" placeholder="Min 6 characters" value={newPassword} onChange={e => setNewPassword(e.target.value)} />
-                  <Button type="button" variant="outline" size="icon" title="Generate secure password" onClick={generatePassword}>
-                    <Sparkles className="w-4 h-4" />
-                  </Button>
-                </div>
-              </div>
-              <div className="space-y-1.5">
-                <Label>Role</Label>
-                <Select value={newRole} onValueChange={setNewRole}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="employee">Employee</SelectItem>
-                    <SelectItem value="manager">Manager</SelectItem>
-                    <SelectItem value="admin">Admin</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
+      {/* --- Add Employee Card --- */}
+      {isAdminOrAbove && (
+        <Card>
+          <CardHeader><CardTitle className="text-lg flex items-center gap-2"><UserPlus className="w-5 h-5" /> Add Employee</CardTitle></CardHeader>
+          <CardContent className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            <Input placeholder="Full Name" value={newName} onChange={e => setNewName(e.target.value)} />
+            <Input placeholder="Email" value={newEmail} onChange={e => setNewEmail(e.target.value)} />
+            <div className="flex gap-2">
+              <Input placeholder="Password" value={newPassword} onChange={e => setNewPassword(e.target.value)} />
+              <Button variant="outline" size="icon" onClick={generatePassword}><Sparkles className="w-4 h-4" /></Button>
             </div>
-            <p className="text-xs text-muted-foreground">
-              Admin-created accounts are automatically <span className="text-emerald-600 font-medium">approved</span> — no manual review needed.
-            </p>
-            <Button onClick={createUser} disabled={creating} className="w-full sm:w-auto">
-              {creating ? 'Creating...' : 'Create Account'}
-            </Button>
+            <Button onClick={createUser} disabled={actionLoading === 'creating'} className="bg-orange-500">Create Account</Button>
           </CardContent>
         </Card>
       )}
 
-      {/* ── Active / Suspended Members ────────────────────────────────────── */}
-      <div className="space-y-2">
-        {activeMembers.map(m => {
-          const isSelf = m.user_id === user?.id;
-          const sb = statusBadge(m.status);
-          return (
-            <Card key={m.user_id}>
-              <CardContent className="flex flex-col sm:flex-row sm:items-center gap-3 py-3 justify-between">
-                <div className="flex items-center gap-3">
-                  {/* Suspended indicator */}
-                  {m.status === 'suspended' && (
-                    <ShieldAlert className="w-4 h-4 text-destructive flex-shrink-0" title="Account suspended" />
-                  )}
-                  <div>
-                    <span className="font-medium text-sm">{m.full_name || 'No name'}</span>
-                    <span className="text-xs text-muted-foreground ml-2">{m.email}</span>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2 flex-wrap">
-                  {/* Status badge */}
-                  <Badge variant="outline" className={sb.className}>{sb.label}</Badge>
-
-                  {/* Role selector */}
-                  {canManage ? (
-                    <Select value={m.role} onValueChange={v => changeRole(m.user_id, v)}>
-                      <SelectTrigger className="w-36"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="employee">Employee</SelectItem>
-                        <SelectItem value="manager">Manager</SelectItem>
-                        <SelectItem value="admin">Admin</SelectItem>
-                        <SelectItem value="super_admin">Super Admin</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  ) : (
-                    <Badge variant="outline" className={roleBadgeColor(m.role)}>{m.role.replace('_', ' ')}</Badge>
-                  )}
-
-                  {canManage && !isSelf && (
-                    <>
-                      {/* Suspend / Reinstate toggle */}
-                      {m.status === 'approved' ? (
-                        <Button
-                          size="sm" variant="outline"
-                          className="text-destructive border-destructive/30 hover:bg-destructive/10"
-                          disabled={actionLoading === `status-${m.user_id}`}
-                          title="Suspend user"
-                          onClick={() => setUserStatus(m.user_id, 'suspended', m.full_name || m.email || 'User')}
-                        >
-                          <XCircle className="w-3.5 h-3.5" />
-                        </Button>
-                      ) : (
-                        <Button
-                          size="sm" variant="outline"
-                          className="text-emerald-600 border-emerald-500/30 hover:bg-emerald-500/10"
-                          disabled={actionLoading === `status-${m.user_id}`}
-                          title="Reinstate user"
-                          onClick={() => setUserStatus(m.user_id, 'approved', m.full_name || m.email || 'User')}
-                        >
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                        </Button>
-                      )}
-
-                      {/* Force logout */}
-                      <Button
-                        size="sm" variant="outline"
-                        disabled={actionLoading === `force_logout-${m.user_id}`}
-                        onClick={() => manageUser('force_logout', m.user_id)}
-                        title="Force Logout"
-                      >
-                        <LogOut className="w-3.5 h-3.5" />
+      {/* --- Main Team Table --- */}
+      <Card>
+        <CardHeader className="pb-3 border-b flex flex-row items-center justify-between">
+          <div className="relative max-w-sm w-full">
+            <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+            <Input placeholder="Search team..." className="pl-9 bg-muted/40" value={search} onChange={(e) => setSearch(e.target.value)} />
+          </div>
+          <Button variant="ghost" size="icon" onClick={fetchTeam}><Settings2 className="w-4 h-4" /></Button>
+        </CardHeader>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow className="bg-muted/30">
+                <TableHead>NAME</TableHead>
+                <TableHead>EMAIL</TableHead>
+                <TableHead>DESIGNATION</TableHead>
+                <TableHead>ROLE</TableHead>
+                <TableHead>STATUS</TableHead>
+                <TableHead className="text-right">ACTIONS</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {filteredMembers.map((member) => (
+                <TableRow key={member.user_id}>
+                  <TableCell className="font-medium">{member.full_name || "—"}</TableCell>
+                  <TableCell className="text-muted-foreground">{member.email}</TableCell>
+                  <TableCell>{member.designation || "—"}</TableCell>
+                  <TableCell><Badge variant="secondary" className="capitalize">{member.role.replace('_', ' ')}</Badge></TableCell>
+                  <TableCell>
+                    <Badge variant="outline" className={member.status === 'approved' ? 'text-emerald-600 border-emerald-500/30' : 'text-amber-600'}>
+                      {member.status}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="text-right flex justify-end gap-1">
+                    {isAdminOrAbove && (
+                      <Button variant="ghost" size="icon" onClick={() => openManagementModal(member)}>
+                        <Shield className="w-4 h-4 text-muted-foreground" />
                       </Button>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
 
-                      {/* Reset password */}
-                      <AlertDialog open={resetPasswordId === m.user_id} onOpenChange={o => { if (!o) { setResetPasswordId(null); setResetPassword(''); } }}>
-                        <AlertDialogTrigger asChild>
-                          <Button size="sm" variant="outline" onClick={() => setResetPasswordId(m.user_id)} title="Reset Password">
-                            <KeyRound className="w-3.5 h-3.5" />
-                          </Button>
-                        </AlertDialogTrigger>
-                        <AlertDialogContent>
-                          <AlertDialogHeader>
-                            <AlertDialogTitle>Reset Password for {m.full_name || m.email}</AlertDialogTitle>
-                            <AlertDialogDescription>Enter a new password (min 6 chars).</AlertDialogDescription>
-                          </AlertDialogHeader>
-                          <Input type="password" placeholder="New password" value={resetPassword} onChange={e => setResetPassword(e.target.value)} />
-                          <AlertDialogFooter>
-                            <AlertDialogCancel>Cancel</AlertDialogCancel>
-                            <AlertDialogAction
-                              disabled={resetPassword.length < 6 || actionLoading === `reset_password-${m.user_id}`}
-                              onClick={() => manageUser('reset_password', m.user_id, { new_password: resetPassword })}
-                            >
-                              Reset
-                            </AlertDialogAction>
-                          </AlertDialogFooter>
-                        </AlertDialogContent>
-                      </AlertDialog>
-
-                      {/* Delete */}
-                      <AlertDialog>
-                        <AlertDialogTrigger asChild>
-                          <Button size="sm" variant="destructive" title="Delete User">
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </Button>
-                        </AlertDialogTrigger>
-                        <AlertDialogContent>
-                          <AlertDialogHeader>
-                            <AlertDialogTitle>Delete {m.full_name || m.email}?</AlertDialogTitle>
-                            <AlertDialogDescription>
-                              This will permanently delete the user account and all their data. This cannot be undone.
-                            </AlertDialogDescription>
-                          </AlertDialogHeader>
-                          <AlertDialogFooter>
-                            <AlertDialogCancel>Cancel</AlertDialogCancel>
-                            <AlertDialogAction
-                              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                              disabled={actionLoading === `delete-${m.user_id}`}
-                              onClick={() => manageUser('delete', m.user_id)}
-                            >
-                              Delete
-                            </AlertDialogAction>
-                          </AlertDialogFooter>
-                        </AlertDialogContent>
-                      </AlertDialog>
-                    </>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-          );
-        })}
-
-        {activeMembers.length === 0 && pendingMembers.length === 0 && (
-          <p className="text-sm text-muted-foreground text-center py-8">No team members yet.</p>
-        )}
-      </div>
+      {/* --- Assign Role & Modules Modal --- */}
+      <Dialog open={isManageModalOpen} onOpenChange={setIsManageModalOpen}>
+        <DialogContent className="max-w-md bg-sidebar border-sidebar-border">
+          <DialogHeader><DialogTitle>Assign Role & Modules</DialogTitle></DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label>Role</Label>
+              <Select value={tempRole} onValueChange={setTempRole}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="employee">Employee</SelectItem>
+                  <SelectItem value="manager">Manager</SelectItem>
+                  <SelectItem value="admin">Admin</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>Designation</Label>
+              <Input value={tempDesignation} onChange={(e) => setTempDesignation(e.target.value)} placeholder="e.g. Sales Executive" />
+            </div>
+            <div className="space-y-3">
+              <Label>Module Access</Label>
+              <div className="grid grid-cols-1 gap-2">
+                {MODULE_OPTIONS.map((m) => (
+                  <div key={m.id} className="flex items-center space-x-3">
+                    <Checkbox id={m.id} checked={tempModules.includes(m.id)} onCheckedChange={() => toggleModule(m.id)} />
+                    <label htmlFor={m.id} className="text-sm cursor-pointer">{m.label}</label>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button className="w-full bg-orange-500" onClick={handleSaveModules} disabled={isSaving}>
+              {isSaving ? "Saving..." : "Assign Role & Modules"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
